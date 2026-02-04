@@ -1,0 +1,13 @@
+# Build artifacts
+bin/
+obj/
+.publish/
+publish/
+publish-small/
+
+# .NET user-specific
+*.user
+*.suo
+*.cache
+*.log
+.env
