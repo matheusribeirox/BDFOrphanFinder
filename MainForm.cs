@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Data.Common;
 using System.Data.SqlClient;
 using System.Text;
+using Oracle.ManagedDataAccess.Client;
 
 namespace BDFOrphanFinder;
 
@@ -8,8 +10,10 @@ public partial class MainForm : Form
 {
     private TextBox txtBdocPath = null!;
     private TextBox txtSystemName = null!;
+    private ComboBox cmbDatabaseType = null!;
     private TextBox txtServer = null!;
     private TextBox txtDatabase = null!;
+    private TextBox txtPort = null!;
     private TextBox txtUsername = null!;
     private TextBox txtPassword = null!;
     private ComboBox cmbSearchMethod = null!;
@@ -23,6 +27,11 @@ public partial class MainForm : Form
     private Label lblStatus = null!;
     private Label lblProgress = null!;
     private RichTextBox txtLog = null!;
+
+    // Labels que mudam dinamicamente conforme o tipo de banco
+    private Label lblServer = null!;
+    private Label lblDatabase = null!;
+    private Label lblPort = null!;
 
     private CancellationTokenSource? _cts;
     private ConcurrentBag<OrphanFile> _orphanFiles = new();
@@ -38,6 +47,8 @@ public partial class MainForm : Form
     private int _totalFilesCopied = 0;
     private int _totalCopyErrors = 0;
 
+    private bool IsOracle => cmbDatabaseType.SelectedIndex == 1;
+
     public MainForm()
     {
         InitializeComponent();
@@ -47,8 +58,8 @@ public partial class MainForm : Form
     private void InitializeComponent()
     {
         this.Text = "Identificador de Arquivos BDF Orfaos";
-        this.Size = new Size(900, 700);
-        this.MinimumSize = new Size(800, 600);
+        this.Size = new Size(900, 750);
+        this.MinimumSize = new Size(800, 650);
         this.StartPosition = FormStartPosition.CenterScreen;
         this.Font = new Font("Segoe UI", 9.5f);
         this.BackColor = Color.FromArgb(248, 249, 252);
@@ -82,7 +93,7 @@ public partial class MainForm : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             ColumnCount = 6,
-            RowCount = 7,
+            RowCount = 8,
             BackColor = Color.White
         };
         configPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));  // Col 0: Label
@@ -118,24 +129,45 @@ public partial class MainForm : Form
         txtSystemName = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
         configPanel.Controls.Add(txtSystemName, 4, 0);
 
-        // Row 1: Server + Database
-        configPanel.Controls.Add(new Label { Text = "Servidor SQL:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 1);
+        // Row 1: Tipo Banco + Servidor
+        configPanel.Controls.Add(new Label { Text = "Tipo Banco:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 1);
+        cmbDatabaseType = new ComboBox
+        {
+            Dock = DockStyle.Fill,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.White,
+            Font = textBoxFont
+        };
+        cmbDatabaseType.Items.AddRange(new object[] { "SQL Server", "Oracle" });
+        cmbDatabaseType.SelectedIndex = 0;
+        cmbDatabaseType.SelectedIndexChanged += CmbDatabaseType_SelectedIndexChanged;
+        configPanel.Controls.Add(cmbDatabaseType, 1, 1);
+        lblServer = new Label { Text = "Servidor SQL:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont };
+        configPanel.Controls.Add(lblServer, 3, 1);
         txtServer = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtServer, 1, 1);
-        configPanel.Controls.Add(new Label { Text = "Banco de Dados:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 1);
+        configPanel.Controls.Add(txtServer, 4, 1);
+
+        // Row 2: Database/Service Name + Port
+        lblDatabase = new Label { Text = "Banco de Dados:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont };
+        configPanel.Controls.Add(lblDatabase, 0, 2);
         txtDatabase = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtDatabase, 4, 1);
+        configPanel.Controls.Add(txtDatabase, 1, 2);
+        lblPort = new Label { Text = "Porta:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont, Visible = false };
+        configPanel.Controls.Add(lblPort, 3, 2);
+        txtPort = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont, Text = "1521", Visible = false };
+        configPanel.Controls.Add(txtPort, 4, 2);
 
-        // Row 2: Username + Password
-        configPanel.Controls.Add(new Label { Text = "Usuario:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 2);
+        // Row 3: Username + Password
+        configPanel.Controls.Add(new Label { Text = "Usuario:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 3);
         txtUsername = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtUsername, 1, 2);
-        configPanel.Controls.Add(new Label { Text = "Senha:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 2);
+        configPanel.Controls.Add(txtUsername, 1, 3);
+        configPanel.Controls.Add(new Label { Text = "Senha:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 3);
         txtPassword = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtPassword, 4, 2);
+        configPanel.Controls.Add(txtPassword, 4, 3);
 
-        // Row 3: Search Method + Parallelism
-        configPanel.Controls.Add(new Label { Text = "Metodo de Busca:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 3);
+        // Row 4: Search Method + Parallelism
+        configPanel.Controls.Add(new Label { Text = "Metodo de Busca:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 4);
         cmbSearchMethod = new ComboBox
         {
             Dock = DockStyle.Fill,
@@ -146,9 +178,9 @@ public partial class MainForm : Form
         };
         cmbSearchMethod.Items.AddRange(new object[] { "Hibrido Paralelo (Recomendado)", ".NET EnumerateFiles", "Robocopy" });
         cmbSearchMethod.SelectedIndex = 0;
-        configPanel.Controls.Add(cmbSearchMethod, 1, 3);
+        configPanel.Controls.Add(cmbSearchMethod, 1, 4);
 
-        configPanel.Controls.Add(new Label { Text = "Threads:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 3);
+        configPanel.Controls.Add(new Label { Text = "Threads:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 4);
         numParallelism = new NumericUpDown
         {
             Minimum = 1,
@@ -159,12 +191,12 @@ public partial class MainForm : Form
             BackColor = Color.White,
             Font = textBoxFont
         };
-        configPanel.Controls.Add(numParallelism, 4, 3);
+        configPanel.Controls.Add(numParallelism, 4, 4);
 
-        // Row 4: Backup Path
-        configPanel.Controls.Add(new Label { Text = "Caminho Backup BDF:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 4);
+        // Row 5: Backup Path
+        configPanel.Controls.Add(new Label { Text = "Caminho Backup BDF:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 5);
         txtBackupPath = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtBackupPath, 1, 4);
+        configPanel.Controls.Add(txtBackupPath, 1, 5);
         btnBrowseBackup = new Button
         {
             Text = "...", Width = 32, Height = 26,
@@ -175,9 +207,9 @@ public partial class MainForm : Form
         btnBrowseBackup.FlatAppearance.BorderSize = 1;
         btnBrowseBackup.FlatAppearance.MouseOverBackColor = Color.FromArgb(240, 240, 240);
         btnBrowseBackup.Click += BtnBrowseBackup_Click;
-        configPanel.Controls.Add(btnBrowseBackup, 2, 4);
+        configPanel.Controls.Add(btnBrowseBackup, 2, 5);
 
-        // Row 5: Buttons
+        // Row 6: Buttons
         var buttonPanel = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -218,7 +250,7 @@ public partial class MainForm : Form
         buttonPanel.Controls.Add(btnStart);
         buttonPanel.Controls.Add(btnCancel);
 
-        configPanel.Controls.Add(buttonPanel, 1, 5);
+        configPanel.Controls.Add(buttonPanel, 1, 6);
         configPanel.SetColumnSpan(buttonPanel, 4);
 
         configGroup.Controls.Add(configPanel);
@@ -273,6 +305,24 @@ public partial class MainForm : Form
         mainPanel.Controls.Add(statusPanel, 0, 2);
 
         this.Controls.Add(mainPanel);
+    }
+
+    private void CmbDatabaseType_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (IsOracle)
+        {
+            lblServer.Text = "Servidor Oracle:";
+            lblDatabase.Text = "Service Name:";
+            lblPort.Visible = true;
+            txtPort.Visible = true;
+        }
+        else
+        {
+            lblServer.Text = "Servidor SQL:";
+            lblDatabase.Text = "Banco de Dados:";
+            lblPort.Visible = false;
+            txtPort.Visible = false;
+        }
     }
 
     private void BtnBrowse_Click(object? sender, EventArgs e)
@@ -368,11 +418,20 @@ public partial class MainForm : Form
             return false;
         }
 
+        var dbType = IsOracle ? "Oracle" : "SQL Server";
+
         if (string.IsNullOrWhiteSpace(txtServer.Text) ||
             string.IsNullOrWhiteSpace(txtDatabase.Text) ||
             string.IsNullOrWhiteSpace(txtUsername.Text))
         {
-            MessageBox.Show("Dados de conexao SQL Server incompletos.", "Validacao",
+            MessageBox.Show($"Dados de conexao {dbType} incompletos.", "Validacao",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        if (IsOracle && string.IsNullOrWhiteSpace(txtPort.Text))
+        {
+            MessageBox.Show("Porta do Oracle e obrigatoria.", "Validacao",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
@@ -396,8 +455,10 @@ public partial class MainForm : Form
         txtBdocPath.Enabled = !running;
         txtBackupPath.Enabled = !running;
         txtSystemName.Enabled = !running;
+        cmbDatabaseType.Enabled = !running;
         txtServer.Enabled = !running;
         txtDatabase.Enabled = !running;
+        txtPort.Enabled = !running;
         txtUsername.Enabled = !running;
         txtPassword.Enabled = !running;
         cmbSearchMethod.Enabled = !running;
@@ -448,16 +509,60 @@ public partial class MainForm : Form
         lblStatus.Text = status;
     }
 
+    // ===== Metodos auxiliares de abstração de banco =====
+
+    private string BuildConnectionString(int maxParallelism)
+    {
+        if (IsOracle)
+        {
+            return $"Data Source=(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST={txtServer.Text})(PORT={txtPort.Text})))(CONNECT_DATA=(SERVICE_NAME={txtDatabase.Text})));User Id={txtUsername.Text};Password={txtPassword.Text};Max Pool Size={maxParallelism + 5};";
+        }
+        else
+        {
+            return $"Server={txtServer.Text};Database={txtDatabase.Text};User Id={txtUsername.Text};Password={txtPassword.Text};TrustServerCertificate=True;Max Pool Size={maxParallelism + 5};";
+        }
+    }
+
+    private DbConnection CreateConnection(string connectionString)
+    {
+        if (IsOracle)
+            return new OracleConnection(connectionString);
+        return new SqlConnection(connectionString);
+    }
+
+    private string BuildHandleQuery(string tableName, string? inClause = null)
+    {
+        if (IsOracle)
+        {
+            var q = $"SELECT DISTINCT HANDLE FROM \"{tableName.ToUpperInvariant()}\"";
+            return inClause != null ? $"{q} WHERE HANDLE IN ({inClause})" : q;
+        }
+        else
+        {
+            var q = $"SELECT DISTINCT HANDLE FROM [{tableName}] WITH (NOLOCK)";
+            return inClause != null ? $"{q} WHERE HANDLE IN ({inClause})" : q;
+        }
+    }
+
+    private int GetBatchSize()
+    {
+        // Oracle tem limite de 1000 expressoes na clausula IN
+        // SQL Server suporta ate ~2000
+        return IsOracle ? 1000 : 2000;
+    }
+
     private async Task ProcessOrphanFilesAsync(CancellationToken ct)
     {
         var bdocPath = txtBdocPath.Text;
         var systemName = txtSystemName.Text;
         var maxParallelism = (int)numParallelism.Value;
         var searchMethod = cmbSearchMethod.SelectedIndex;
+        var dbType = IsOracle ? "Oracle" : "SQL Server";
 
         Log("Iniciando processamento...", Color.Cyan);
         Log($"Diretorio BDOC: {bdocPath}");
         Log($"Sistema: {systemName}");
+        Log($"Banco de dados: {dbType}");
         Log($"Metodo: {cmbSearchMethod.SelectedItem}");
         Log($"Threads: {maxParallelism}");
         Log("");
@@ -483,12 +588,12 @@ public partial class MainForm : Form
             return;
         }
 
-        // Connection string for parallel connections
-        var connectionString = $"Server={txtServer.Text};Database={txtDatabase.Text};User Id={txtUsername.Text};Password={txtPassword.Text};TrustServerCertificate=True;Max Pool Size={maxParallelism + 5};";
+        // Connection string
+        var connectionString = BuildConnectionString(maxParallelism);
 
         // Test connection
-        Log("Testando conexao com banco de dados...");
-        using (var testConn = new SqlConnection(connectionString))
+        Log($"Testando conexao com banco de dados {dbType}...");
+        using (var testConn = CreateConnection(connectionString))
         {
             await testConn.OpenAsync(ct);
             Log("Conexao estabelecida com sucesso!", Color.Green);
@@ -565,6 +670,7 @@ public partial class MainForm : Form
         Log("============================================", Color.Cyan);
         Log("           RELATORIO FINAL", Color.Cyan);
         Log("============================================", Color.Cyan);
+        Log($"Banco de dados: {dbType}");
         Log($"Total de arquivos analisados: {_totalFilesAnalyzed}");
         Log($"Arquivos COM registro na base: {_filesWithRecord}", Color.Green);
         Log($"Arquivos ORFAOS (sem registro): {orphanCount}", orphanCount > 0 ? Color.Red : Color.Green);
@@ -738,7 +844,7 @@ public partial class MainForm : Form
                         Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
                     }
                 }
-                catch (SqlException ex)
+                catch (DbException ex)
                 {
                     Log($"  [AVISO] Erro na tabela {tableName}: {ex.Message}", Color.Yellow);
                 }
@@ -770,18 +876,17 @@ public partial class MainForm : Form
 
     /// <summary>
     /// Busca handles existentes no banco usando IN clause em batches
-    /// Limite de ~2000 parâmetros por query no SQL Server
     /// </summary>
-    private static async Task<HashSet<int>> QueryExistingHandlesAsync(
+    private async Task<HashSet<int>> QueryExistingHandlesAsync(
         string connectionString,
         string tableName,
         List<int> handles,
         CancellationToken ct)
     {
         var existingHandles = new HashSet<int>();
-        const int batchSize = 2000; // SQL Server limit
+        var batchSize = GetBatchSize();
 
-        using var connection = new SqlConnection(connectionString);
+        using var connection = CreateConnection(connectionString);
         await connection.OpenAsync(ct);
 
         for (int i = 0; i < handles.Count; i += batchSize)
@@ -791,9 +896,10 @@ public partial class MainForm : Form
             var batch = handles.Skip(i).Take(batchSize).ToList();
             var inClause = string.Join(",", batch);
 
-            var query = $"SELECT DISTINCT HANDLE FROM [{tableName}] WITH (NOLOCK) WHERE HANDLE IN ({inClause})";
+            var query = BuildHandleQuery(tableName, inClause);
 
-            using var cmd = new SqlCommand(query, connection);
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = query;
             cmd.CommandTimeout = 120;
 
             using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -821,7 +927,7 @@ public partial class MainForm : Form
         Log("=== Processamento Sequencial (Legado) ===", Color.Yellow);
         var phase1Start = DateTime.Now;
 
-        using var connection = new SqlConnection(connectionString);
+        using var connection = CreateConnection(connectionString);
         await connection.OpenAsync(ct);
 
         // Discover tables
@@ -860,8 +966,9 @@ public partial class MainForm : Form
             var handles = new HashSet<int>();
             try
             {
-                var query = $"SELECT DISTINCT HANDLE FROM [{table}] WITH (NOLOCK)";
-                using var cmd = new SqlCommand(query, connection);
+                var query = BuildHandleQuery(table);
+                using var cmd = connection.CreateCommand();
+                cmd.CommandText = query;
                 cmd.CommandTimeout = 300;
 
                 using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -871,7 +978,7 @@ public partial class MainForm : Form
                         handles.Add(reader.GetInt32(0));
                 }
             }
-            catch (SqlException ex)
+            catch (DbException ex)
             {
                 Log($"  [AVISO] Erro ao consultar tabela {table}: {ex.Message}", Color.Yellow);
                 continue;
@@ -1046,7 +1153,9 @@ public partial class MainForm : Form
                 txtUsername.Text,
                 cmbSearchMethod.SelectedIndex.ToString(),
                 numParallelism.Value.ToString(),
-                txtBackupPath.Text
+                txtBackupPath.Text,
+                cmbDatabaseType.SelectedIndex.ToString(),
+                txtPort.Text
             };
             File.WriteAllLines(settingsPath, lines);
         }
@@ -1078,6 +1187,15 @@ public partial class MainForm : Form
                 if (lines.Length >= 8)
                 {
                     txtBackupPath.Text = lines[7];
+                }
+                // Novos campos: tipo de banco e porta
+                if (lines.Length >= 9 && int.TryParse(lines[8], out var dbType))
+                {
+                    cmbDatabaseType.SelectedIndex = Math.Min(dbType, cmbDatabaseType.Items.Count - 1);
+                }
+                if (lines.Length >= 10)
+                {
+                    txtPort.Text = lines[9];
                 }
             }
         }
