@@ -1,10 +1,395 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Data.SqlClient;
+using System.Runtime.InteropServices;
 using System.Text;
 using Oracle.ManagedDataAccess.Client;
 
 namespace BDFOrphanFinder;
+
+#region Win32 API Interop
+internal static class NativeMethods
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct WIN32_FIND_DATA
+    {
+        public uint dwFileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint dwReserved0;
+        public uint dwReserved1;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string cFileName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+        public string cAlternateFileName;
+    }
+
+    public const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
+    public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATA lpFindFileData);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATA lpFindFileData);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool FindClose(IntPtr hFindFile);
+
+    // ===== MFT (Master File Table) Access =====
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName,
+        uint dwDesiredAccess,
+        uint dwShareMode,
+        IntPtr lpSecurityAttributes,
+        uint dwCreationDisposition,
+        uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool DeviceIoControl(
+        IntPtr hDevice,
+        uint dwIoControlCode,
+        ref MFT_ENUM_DATA_V0 lpInBuffer,
+        int nInBufferSize,
+        IntPtr lpOutBuffer,
+        int nOutBufferSize,
+        out int lpBytesReturned,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    // Constants for MFT access
+    public const uint GENERIC_READ = 0x80000000;
+    public const uint FILE_SHARE_READ = 0x00000001;
+    public const uint FILE_SHARE_WRITE = 0x00000002;
+    public const uint OPEN_EXISTING = 3;
+    public const uint FSCTL_ENUM_USN_DATA = 0x000900b3;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MFT_ENUM_DATA_V0
+    {
+        public long StartFileReferenceNumber;
+        public long LowUsn;
+        public long HighUsn;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct USN_RECORD
+    {
+        public int RecordLength;
+        public short MajorVersion;
+        public short MinorVersion;
+        public long FileReferenceNumber;
+        public long ParentFileReferenceNumber;
+        public long Usn;
+        public long TimeStamp;
+        public int Reason;
+        public int SourceInfo;
+        public int SecurityId;
+        public uint FileAttributes;
+        public short FileNameLength;
+        public short FileNameOffset;
+        // FileName follows (variable length)
+    }
+}
+#endregion
+
+#region MFT Scanner
+/// <summary>
+/// Scanner de alta performance que lê diretamente da MFT (Master File Table) do NTFS
+/// Similar ao que o Everything Search faz - indexa milhões de arquivos em segundos
+/// REQUER: Execução como Administrador
+/// </summary>
+internal static class MftScanner
+{
+    // Limite de memória padrão: 1.5GB (deixa margem para o resto do app)
+    private const long DEFAULT_MEMORY_LIMIT_BYTES = 1536L * 1024 * 1024;
+
+    // Tamanho estimado por entrada de diretório em memória (~100 bytes)
+    private const int ESTIMATED_DIR_ENTRY_SIZE = 100;
+
+    // Tamanho estimado por arquivo encontrado (~150 bytes)
+    private const int ESTIMATED_FILE_ENTRY_SIZE = 150;
+
+    /// <summary>
+    /// Escaneia o volume MFT buscando arquivos com a extensão especificada.
+    /// OTIMIZAÇÃO: Se basePath for fornecido, apenas diretórios dentro desse caminho serão considerados,
+    /// reduzindo drasticamente o uso de memória.
+    /// </summary>
+    /// <param name="driveLetter">Letra do drive (ex: 'B')</param>
+    /// <param name="extension">Extensão do arquivo (ex: ".BDF")</param>
+    /// <param name="basePath">Caminho base para filtrar. Se fornecido, apenas arquivos dentro deste path serão retornados.</param>
+    /// <param name="progressCallback">Callback de progresso</param>
+    /// <param name="memoryLimitBytes">Limite de memória em bytes</param>
+    public static List<MftFileInfo> ScanVolume(
+        char driveLetter,
+        string extension,
+        string? basePath = null,
+        Action<int>? progressCallback = null,
+        long memoryLimitBytes = DEFAULT_MEMORY_LIMIT_BYTES)
+    {
+        var files = new List<MftFileInfo>();
+
+        // Usar dicionário com capacidade inicial menor para economizar memória
+        // Se temos basePath, precisamos de muito menos entradas
+        var initialCapacity = string.IsNullOrEmpty(basePath) ? 500000 : 50000;
+        var directories = new Dictionary<long, DirectoryEntry>(initialCapacity);
+
+        // Preparar filtro de basePath
+        string[]? basePathParts = null;
+        if (!string.IsNullOrEmpty(basePath))
+        {
+            // Normalizar basePath: remover drive letter e separar em partes
+            // Ex: "B:\BDOC\sistema" -> ["BDOC", "sistema"]
+            var pathWithoutDrive = basePath.Length > 2 && basePath[1] == ':'
+                ? basePath.Substring(3)  // Remove "B:\"
+                : basePath;
+            basePathParts = pathWithoutDrive.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        var volumePath = $"\\\\.\\{driveLetter}:";
+        var handle = NativeMethods.CreateFileW(
+            volumePath,
+            NativeMethods.GENERIC_READ,
+            NativeMethods.FILE_SHARE_READ | NativeMethods.FILE_SHARE_WRITE,
+            IntPtr.Zero,
+            NativeMethods.OPEN_EXISTING,
+            0,
+            IntPtr.Zero);
+
+        if (handle == NativeMethods.INVALID_HANDLE_VALUE)
+        {
+            var error = Marshal.GetLastWin32Error();
+            throw new InvalidOperationException($"Nao foi possivel acessar o volume {driveLetter}:. Erro: {error}. Execute como Administrador.");
+        }
+
+        try
+        {
+            var mftData = new NativeMethods.MFT_ENUM_DATA_V0
+            {
+                StartFileReferenceNumber = 0,
+                LowUsn = 0,
+                HighUsn = long.MaxValue
+            };
+
+            const int bufferSize = 64 * 1024; // 64KB buffer (reduzido)
+            var buffer = Marshal.AllocHGlobal(bufferSize);
+            var extUpper = extension.ToUpperInvariant().TrimStart('*');
+
+            // Cache de diretórios que estão no caminho do basePath (para otimização)
+            // Key: fileRef, Value: true se está no caminho ou é ancestral do basePath
+            HashSet<long>? relevantDirs = basePathParts != null ? new HashSet<long>() : null;
+
+            try
+            {
+                int recordCount = 0;
+                long estimatedMemoryUsage = 0;
+                bool memoryWarningLogged = false;
+
+                while (NativeMethods.DeviceIoControl(
+                    handle,
+                    NativeMethods.FSCTL_ENUM_USN_DATA,
+                    ref mftData,
+                    Marshal.SizeOf(mftData),
+                    buffer,
+                    bufferSize,
+                    out int bytesReturned,
+                    IntPtr.Zero))
+                {
+                    if (bytesReturned <= 8) break;
+
+                    // Verificar limite de memória periodicamente
+                    if (recordCount % 50000 == 0)
+                    {
+                        estimatedMemoryUsage = (long)directories.Count * ESTIMATED_DIR_ENTRY_SIZE +
+                                              (long)files.Count * ESTIMATED_FILE_ENTRY_SIZE;
+
+                        if (estimatedMemoryUsage > memoryLimitBytes)
+                        {
+                            if (!memoryWarningLogged)
+                            {
+                                memoryWarningLogged = true;
+                            }
+
+                            // Limpar diretórios que provavelmente não serão usados
+                            if (directories.Count > 1000000)
+                            {
+                                CompactDirectories(directories, files);
+                            }
+                        }
+                    }
+
+                    mftData.StartFileReferenceNumber = Marshal.ReadInt64(buffer, 0);
+                    int offset = 8;
+
+                    while (offset < bytesReturned)
+                    {
+                        var recordLength = Marshal.ReadInt32(buffer, offset);
+                        if (recordLength == 0) break;
+
+                        var fileRef = Marshal.ReadInt64(buffer, offset + 8);
+                        var parentRef = Marshal.ReadInt64(buffer, offset + 16);
+                        var fileAttributes = (uint)Marshal.ReadInt32(buffer, offset + 52);
+                        var fileNameLength = Marshal.ReadInt16(buffer, offset + 56);
+                        var fileNameOffset = Marshal.ReadInt16(buffer, offset + 58);
+
+                        var fileName = Marshal.PtrToStringUni(buffer + offset + fileNameOffset, fileNameLength / 2);
+
+                        if (!string.IsNullOrEmpty(fileName) && fileName != "." && fileName != "..")
+                        {
+                            var isDirectory = (fileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+                            if (isDirectory)
+                            {
+                                // Se temos basePath, só armazenar diretórios que podem ser relevantes
+                                if (basePathParts != null)
+                                {
+                                    // Armazenar sempre - vamos filtrar depois na resolução de paths
+                                    // Mas com capacidade reduzida já economiza memória
+                                    directories[fileRef] = new DirectoryEntry(fileName, parentRef);
+                                }
+                                else
+                                {
+                                    directories[fileRef] = new DirectoryEntry(fileName, parentRef);
+                                }
+                            }
+                            else if (fileName.EndsWith(extUpper, StringComparison.OrdinalIgnoreCase))
+                            {
+                                files.Add(new MftFileInfo
+                                {
+                                    FileReferenceNumber = fileRef,
+                                    ParentFileReferenceNumber = parentRef,
+                                    FileName = fileName
+                                });
+                            }
+                        }
+
+                        recordCount++;
+                        if (recordCount % 100000 == 0)
+                        {
+                            progressCallback?.Invoke(recordCount);
+                        }
+
+                        offset += recordLength;
+                    }
+                }
+
+                // Resolver caminhos completos e filtrar por basePath
+                progressCallback?.Invoke(-1); // Sinaliza início da resolução de paths
+
+                var filteredFiles = new List<MftFileInfo>();
+                int resolvedCount = 0;
+                string? basePathUpper = basePath?.ToUpperInvariant().TrimEnd('\\');
+
+                foreach (var file in files)
+                {
+                    var fullPath = $"{driveLetter}:{BuildPath(file.FileName, file.ParentFileReferenceNumber, directories)}";
+                    file.FullPath = fullPath;
+                    resolvedCount++;
+
+                    // Se temos basePath, filtrar apenas arquivos dentro dele
+                    if (basePathUpper != null)
+                    {
+                        if (fullPath.ToUpperInvariant().StartsWith(basePathUpper + "\\"))
+                        {
+                            filteredFiles.Add(file);
+                        }
+                    }
+                    else
+                    {
+                        filteredFiles.Add(file);
+                    }
+
+                    if (resolvedCount % 10000 == 0)
+                    {
+                        progressCallback?.Invoke(-resolvedCount);
+                    }
+                }
+
+                // Liberar memória dos diretórios (não mais necessários)
+                directories.Clear();
+                directories.TrimExcess();
+
+                // Retornar apenas arquivos filtrados
+                files = filteredFiles;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+        finally
+        {
+            NativeMethods.CloseHandle(handle);
+        }
+
+        // Forçar GC para liberar memória
+        GC.Collect(2, GCCollectionMode.Optimized);
+
+        return files;
+    }
+
+    private static void CompactDirectories(Dictionary<long, DirectoryEntry> directories, List<MftFileInfo> files)
+    {
+        // Identificar diretórios que são ancestrais dos arquivos encontrados
+        var neededDirs = new HashSet<long>();
+
+        foreach (var file in files)
+        {
+            var parentRef = file.ParentFileReferenceNumber;
+            while (parentRef != 0 && directories.ContainsKey(parentRef))
+            {
+                if (!neededDirs.Add(parentRef)) break; // Já processado
+                parentRef = directories[parentRef].ParentRef;
+            }
+        }
+
+        // Remover diretórios não necessários
+        var keysToRemove = directories.Keys.Where(k => !neededDirs.Contains(k)).ToList();
+        foreach (var key in keysToRemove)
+        {
+            directories.Remove(key);
+        }
+
+        directories.TrimExcess();
+        GC.Collect(1, GCCollectionMode.Optimized);
+    }
+
+    private static string BuildPath(string fileName, long parentRef, Dictionary<long, DirectoryEntry> directories)
+    {
+        var parts = new Stack<string>();
+        parts.Push(fileName);
+
+        var currentParent = parentRef;
+        int maxDepth = 100; // Prevenir loops infinitos
+
+        while (currentParent != 0 && directories.TryGetValue(currentParent, out var parent) && maxDepth-- > 0)
+        {
+            parts.Push(parent.Name);
+            currentParent = parent.ParentRef;
+        }
+
+        return "\\" + string.Join("\\", parts);
+    }
+
+    // Estrutura compacta para diretórios (economiza memória)
+    private readonly record struct DirectoryEntry(string Name, long ParentRef);
+}
+
+internal class MftFileInfo
+{
+    public long FileReferenceNumber { get; set; }
+    public long ParentFileReferenceNumber { get; set; }
+    public string FileName { get; set; } = "";
+    public string FullPath { get; set; } = "";
+}
+#endregion
 
 public partial class MainForm : Form
 {
@@ -135,7 +520,7 @@ public partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             DropDownStyle = ComboBoxStyle.DropDownList,
-            FlatStyle = FlatStyle.Flat,
+            FlatStyle = FlatStyle.Standard,
             BackColor = Color.White,
             Font = textBoxFont
         };
@@ -172,11 +557,12 @@ public partial class MainForm : Form
         {
             Dock = DockStyle.Fill,
             DropDownStyle = ComboBoxStyle.DropDownList,
-            FlatStyle = FlatStyle.Flat,
+            FlatStyle = FlatStyle.Standard,
             BackColor = Color.White,
             Font = textBoxFont
         };
-        cmbSearchMethod.Items.AddRange(new object[] { "Hibrido Paralelo (Recomendado)", ".NET EnumerateFiles", "Robocopy" });
+        // 0 = MFT (Master File Table), 1 = .NET EnumerateFiles
+        cmbSearchMethod.Items.AddRange(new object[] { "MFT (Master File Table)", ".NET EnumerateFiles" });
         cmbSearchMethod.SelectedIndex = 0;
         configPanel.Controls.Add(cmbSearchMethod, 1, 4);
 
@@ -599,14 +985,16 @@ public partial class MainForm : Form
             Log("Conexao estabelecida com sucesso!", Color.Green);
         }
 
-        // Use hybrid parallel strategy or legacy sequential
-        if (searchMethod == 0) // Híbrido Paralelo
+        // Use strategy based on selection
+        // 0 = MFT (Master File Table) - requer Admin
+        // 1 = .NET EnumerateFiles
+        if (searchMethod == 0) // MFT
+        {
+            await ProcessWithMftStrategyAsync(systemPaths, systemName, connectionString, maxParallelism, ct);
+        }
+        else // .NET EnumerateFiles (Híbrido Paralelo)
         {
             await ProcessWithHybridStrategyAsync(systemPaths, systemName, connectionString, maxParallelism, ct);
-        }
-        else
-        {
-            await ProcessWithLegacyStrategyAsync(systemPaths, systemName, connectionString, searchMethod, ct);
         }
 
         // ================================================================
@@ -697,6 +1085,338 @@ public partial class MainForm : Form
         var reportFileName = $"arquivos_orfaos_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
         var reportPath = Path.Combine(reportDir, reportFileName);
         ExportResults(reportPath);
+    }
+
+    /// <summary>
+    /// ESTRATÉGIA MFT - ULTRA PERFORMANCE
+    /// Lê diretamente da Master File Table do NTFS (como o Everything faz)
+    /// REQUER: Execução como Administrador
+    /// </summary>
+    private async Task ProcessWithMftStrategyAsync(
+        List<string> systemPaths,
+        string systemName,
+        string connectionString,
+        int maxParallelism,
+        CancellationToken ct)
+    {
+        // ================================================================
+        // FASE 1: Leitura direta da MFT
+        // ================================================================
+        Log("");
+        Log("=== FASE 1: Leitura direta da MFT (Master File Table) ===", Color.Cyan);
+        Log("NOTA: Este metodo requer execucao como Administrador", Color.Yellow);
+        var phase1Start = DateTime.Now;
+
+        // Descobrir drive letter do BDOC path
+        var bdocPath = txtBdocPath.Text;
+        var driveLetter = Path.GetPathRoot(bdocPath)?[0] ?? 'C';
+
+        Log($"Escaneando volume {driveLetter}: ...");
+
+        List<MftFileInfo> allBdfFiles;
+        try
+        {
+            // Limite de memória: 1.5GB para o scanner MFT
+            const long memoryLimit = 1536L * 1024 * 1024;
+            Log($"Limite de memoria configurado: {memoryLimit / (1024 * 1024)} MB", Color.Gray);
+            Log($"Filtrando apenas arquivos dentro de: {bdocPath}", Color.Gray);
+
+            allBdfFiles = await Task.Run(() =>
+            {
+                // Passar bdocPath para filtrar apenas arquivos dentro do diretório BDOC
+                // Isso reduz drasticamente o uso de memória
+                return MftScanner.ScanVolume(driveLetter, ".BDF", bdocPath, count =>
+                {
+                    if (count > 0)
+                    {
+                        UpdateProgress(count / 1000 % 100, 100, $"Fase 1: Lendo MFT ({count:N0} registros)");
+                    }
+                    else if (count < 0)
+                    {
+                        // Negativo indica resolução de paths
+                        UpdateProgress(50, 100, $"Fase 1: Resolvendo caminhos ({-count:N0} arquivos)");
+                    }
+                }, memoryLimit);
+            }, ct);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log($"ERRO: {ex.Message}", Color.Red);
+            Log("Alternativa: Use o metodo 'Win32 API' que nao requer Admin.", Color.Yellow);
+            return;
+        }
+        catch (OutOfMemoryException)
+        {
+            Log("ERRO: Memoria insuficiente. Tente o metodo 'Win32 API'.", Color.Red);
+            GC.Collect(2, GCCollectionMode.Forced);
+            return;
+        }
+
+        Log($"Total de arquivos .BDF no volume: {allBdfFiles.Count:N0}", Color.Green);
+
+        // Filtrar apenas arquivos dentro dos systemPaths
+        var normalizedSystemPaths = systemPaths.Select(p => p.ToUpperInvariant().TrimEnd('\\')).ToList();
+
+        var relevantFiles = allBdfFiles
+            .Where(f =>
+            {
+                var upperPath = f.FullPath.ToUpperInvariant();
+                return normalizedSystemPaths.Any(sp => upperPath.StartsWith(sp + "\\"));
+            })
+            .ToList();
+
+        Log($"Arquivos .BDF dentro do sistema: {relevantFiles.Count:N0}", Color.Green);
+
+        // Agrupar por tabela (extrair nome da tabela do caminho)
+        var filesByTable = new ConcurrentDictionary<string, ConcurrentBag<FileHandleInfo>>();
+
+        foreach (var file in relevantFiles)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Extrair tabela do caminho: ...\SISTEMA\TABELA\...
+            foreach (var sp in normalizedSystemPaths)
+            {
+                var upperPath = file.FullPath.ToUpperInvariant();
+                if (upperPath.StartsWith(sp + "\\"))
+                {
+                    var relativePath = file.FullPath.Substring(sp.Length + 1);
+                    var tableName = relativePath.Split('\\')[0];
+
+                    if (TryExtractHandle(file.FullPath, out var handle, out var fileName))
+                    {
+                        var bag = filesByTable.GetOrAdd(tableName, _ => new ConcurrentBag<FileHandleInfo>());
+                        bag.Add(new FileHandleInfo(file.FullPath, fileName, handle));
+                    }
+                    break;
+                }
+            }
+        }
+
+        _phase1Duration = DateTime.Now - phase1Start;
+        _totalFilesAnalyzed = relevantFiles.Count;
+
+        Log($"Tabelas encontradas: {filesByTable.Count}", Color.Green);
+        Log($"Fase 1 concluida em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
+
+        // ================================================================
+        // FASE 2: Validação paralela no banco de dados
+        // ================================================================
+        Log("");
+        Log("=== FASE 2: Validacao paralela no banco de dados ===", Color.Cyan);
+        var phase2Start = DateTime.Now;
+
+        var tablesToProcess = filesByTable.Where(kvp => !kvp.Value.IsEmpty).ToList();
+        var tablesProcessed = 0;
+        var totalTables = tablesToProcess.Count;
+
+        Log($"Tabelas com arquivos para validar: {totalTables}");
+
+        await Parallel.ForEachAsync(tablesToProcess,
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = ct },
+            async (kvp, token) =>
+            {
+                var tableName = kvp.Key;
+                var files = kvp.Value.ToList();
+                var handleList = files.Select(f => f.Handle).Distinct().ToList();
+
+                try
+                {
+                    var existingHandles = await QueryExistingHandlesAsync(
+                        connectionString, tableName, handleList, token);
+
+                    var orphansInTable = 0;
+                    foreach (var file in files)
+                    {
+                        if (!existingHandles.Contains(file.Handle))
+                        {
+                            long size = 0;
+                            try { size = new FileInfo(file.FilePath).Length; } catch { }
+
+                            var orphan = new OrphanFile
+                            {
+                                Sistema = systemName,
+                                Tabela = tableName,
+                                Handle = file.Handle,
+                                FileName = file.FileName,
+                                FilePath = file.FilePath,
+                                Size = size
+                            };
+
+                            _orphanFiles.Add(orphan);
+                            Interlocked.Add(ref _totalOrphanSize, size);
+                            orphansInTable++;
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _filesWithRecord);
+                        }
+                    }
+
+                    if (orphansInTable > 0)
+                    {
+                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
+                    }
+                }
+                catch (DbException ex)
+                {
+                    Log($"  [AVISO] Erro na tabela {tableName}: {ex.Message}", Color.Yellow);
+                }
+
+                var processed = Interlocked.Increment(ref tablesProcessed);
+                Interlocked.Increment(ref _totalTablesProcessed);
+                UpdateProgress(processed, totalTables, $"Fase 2: Validando ({processed}/{totalTables} tabelas)");
+            });
+
+        _phase2Duration = DateTime.Now - phase2Start;
+        Log($"Fase 2 concluida em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
+    }
+
+    /// <summary>
+    /// ESTRATÉGIA WIN32 API - MÁXIMA PERFORMANCE
+    /// Usa FindFirstFile/FindNextFile para enumeração mais rápida
+    /// </summary>
+    private async Task ProcessWithWin32StrategyAsync(
+        List<string> systemPaths,
+        string systemName,
+        string connectionString,
+        int maxParallelism,
+        CancellationToken ct)
+    {
+        // ================================================================
+        // FASE 1: Enumeração com Win32 API por diretório de tabela
+        // ================================================================
+        Log("");
+        Log("=== FASE 1: Enumeracao com Win32 API (Alta Performance) ===", Color.Cyan);
+        var phase1Start = DateTime.Now;
+
+        // Descobrir todos os diretórios de tabelas
+        var tableDirs = new ConcurrentDictionary<string, ConcurrentBag<string>>();
+        foreach (var systemPath in systemPaths)
+        {
+            foreach (var tableDir in Directory.EnumerateDirectories(systemPath))
+            {
+                var tableName = Path.GetFileName(tableDir);
+                tableDirs.GetOrAdd(tableName, _ => new ConcurrentBag<string>()).Add(tableDir);
+            }
+        }
+
+        Log($"Tabelas encontradas: {tableDirs.Count}");
+
+        // Estrutura thread-safe para armazenar arquivos por tabela
+        var filesByTable = new ConcurrentDictionary<string, ConcurrentBag<FileHandleInfo>>();
+        var totalFilesFound = 0;
+        var directoriesProcessed = 0;
+        var totalDirectories = tableDirs.Values.Sum(b => b.Count);
+
+        // Processar diretórios em paralelo usando Win32 API
+        var allDirs = tableDirs.SelectMany(kvp => kvp.Value.Select(dir => (Table: kvp.Key, Dir: dir))).ToList();
+
+        await Parallel.ForEachAsync(allDirs,
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = ct },
+            async (item, token) =>
+            {
+                var (tableName, tableDir) = item;
+                token.ThrowIfCancellationRequested();
+
+                var bag = filesByTable.GetOrAdd(tableName, _ => new ConcurrentBag<FileHandleInfo>());
+                var localFileCount = 0;
+
+                try
+                {
+                    // Usar Win32 API para enumerar arquivos
+                    EnumerateFilesWithWin32Api(tableDir, "*.BDF", bag, ref localFileCount);
+                }
+                catch (Exception) { }
+
+                Interlocked.Add(ref totalFilesFound, localFileCount);
+                var processed = Interlocked.Increment(ref directoriesProcessed);
+
+                if (processed % 10 == 0 || processed == totalDirectories)
+                {
+                    UpdateProgress(processed, totalDirectories, $"Fase 1: Win32 API ({processed}/{totalDirectories} dirs, {totalFilesFound} arquivos)");
+                }
+
+                await Task.CompletedTask;
+            });
+
+        _phase1Duration = DateTime.Now - phase1Start;
+        _totalFilesAnalyzed = totalFilesFound;
+
+        Log($"Arquivos encontrados: {totalFilesFound} em {tableDirs.Count} tabelas", Color.Green);
+        Log($"Fase 1 concluida em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
+
+        // ================================================================
+        // FASE 2: Validação paralela no banco de dados (igual ao híbrido)
+        // ================================================================
+        Log("");
+        Log("=== FASE 2: Validacao paralela no banco de dados ===", Color.Cyan);
+        var phase2Start = DateTime.Now;
+
+        var tablesToProcess = filesByTable.Where(kvp => !kvp.Value.IsEmpty).ToList();
+        var tablesProcessed = 0;
+        var totalTables = tablesToProcess.Count;
+
+        Log($"Tabelas com arquivos para validar: {totalTables}");
+
+        await Parallel.ForEachAsync(tablesToProcess,
+            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = ct },
+            async (kvp, token) =>
+            {
+                var tableName = kvp.Key;
+                var files = kvp.Value.ToList();
+                var handleList = files.Select(f => f.Handle).Distinct().ToList();
+
+                try
+                {
+                    var existingHandles = await QueryExistingHandlesAsync(
+                        connectionString, tableName, handleList, token);
+
+                    var orphansInTable = 0;
+                    foreach (var file in files)
+                    {
+                        if (!existingHandles.Contains(file.Handle))
+                        {
+                            long size = 0;
+                            try { size = new FileInfo(file.FilePath).Length; } catch { }
+
+                            var orphan = new OrphanFile
+                            {
+                                Sistema = systemName,
+                                Tabela = tableName,
+                                Handle = file.Handle,
+                                FileName = file.FileName,
+                                FilePath = file.FilePath,
+                                Size = size
+                            };
+
+                            _orphanFiles.Add(orphan);
+                            Interlocked.Add(ref _totalOrphanSize, size);
+                            orphansInTable++;
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _filesWithRecord);
+                        }
+                    }
+
+                    if (orphansInTable > 0)
+                    {
+                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
+                    }
+                }
+                catch (DbException ex)
+                {
+                    Log($"  [AVISO] Erro na tabela {tableName}: {ex.Message}", Color.Yellow);
+                }
+
+                var processed = Interlocked.Increment(ref tablesProcessed);
+                Interlocked.Increment(ref _totalTablesProcessed);
+                UpdateProgress(processed, totalTables, $"Fase 2: Validando ({processed}/{totalTables} tabelas)");
+            });
+
+        _phase2Duration = DateTime.Now - phase2Start;
+        Log($"Fase 2 concluida em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
     }
 
     /// <summary>
@@ -991,7 +1711,8 @@ public partial class MainForm : Form
                 ct.ThrowIfCancellationRequested();
                 if (!Directory.Exists(tablePath)) continue;
 
-                var files = searchMethod == 1 ? GetFilesWithDotNet(tablePath) : GetFilesWithRobocopy(tablePath);
+                // searchMethod: 3 = .NET EnumerateFiles, 4 = Robocopy
+                var files = searchMethod == 3 ? GetFilesWithDotNet(tablePath) : GetFilesWithRobocopy(tablePath);
 
                 foreach (var filePath in files)
                 {
@@ -1032,14 +1753,8 @@ public partial class MainForm : Form
 
     private IEnumerable<string> GetBdfFiles(string path)
     {
-        if (cmbSearchMethod.SelectedIndex == 1) // Robocopy
-        {
-            return GetFilesWithRobocopy(path);
-        }
-        else // .NET EnumerateFiles
-        {
-            return GetFilesWithDotNet(path);
-        }
+        // Método auxiliar - usa .NET EnumerateFiles como padrão
+        return GetFilesWithDotNet(path);
     }
 
     private IEnumerable<string> GetFilesWithDotNet(string path)
@@ -1093,6 +1808,137 @@ public partial class MainForm : Form
         catch { }
 
         return files;
+    }
+
+    /// <summary>
+    /// Enumeracao de arquivos usando Win32 API (FindFirstFile/FindNextFile)
+    /// Mais rapido que Directory.EnumerateFiles para grandes volumes de arquivos
+    /// </summary>
+    private static IEnumerable<string> GetFilesWithWin32Api(string path, string pattern = "*.BDF")
+    {
+        var files = new List<string>();
+        var directoriesToProcess = new Stack<string>();
+        directoriesToProcess.Push(path);
+
+        while (directoriesToProcess.Count > 0)
+        {
+            var currentDir = directoriesToProcess.Pop();
+
+            // Primeiro, buscar subdiretorios
+            var searchPathDirs = Path.Combine(currentDir, "*");
+            var findHandleDirs = NativeMethods.FindFirstFileW(searchPathDirs, out var findDataDirs);
+
+            if (findHandleDirs != NativeMethods.INVALID_HANDLE_VALUE)
+            {
+                try
+                {
+                    do
+                    {
+                        if (findDataDirs.cFileName == "." || findDataDirs.cFileName == "..")
+                            continue;
+
+                        if ((findDataDirs.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0)
+                        {
+                            directoriesToProcess.Push(Path.Combine(currentDir, findDataDirs.cFileName));
+                        }
+                    } while (NativeMethods.FindNextFileW(findHandleDirs, out findDataDirs));
+                }
+                finally
+                {
+                    NativeMethods.FindClose(findHandleDirs);
+                }
+            }
+
+            // Depois, buscar arquivos com o pattern
+            var searchPathFiles = Path.Combine(currentDir, pattern);
+            var findHandleFiles = NativeMethods.FindFirstFileW(searchPathFiles, out var findDataFiles);
+
+            if (findHandleFiles != NativeMethods.INVALID_HANDLE_VALUE)
+            {
+                try
+                {
+                    do
+                    {
+                        if ((findDataFiles.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) == 0)
+                        {
+                            files.Add(Path.Combine(currentDir, findDataFiles.cFileName));
+                        }
+                    } while (NativeMethods.FindNextFileW(findHandleFiles, out findDataFiles));
+                }
+                finally
+                {
+                    NativeMethods.FindClose(findHandleFiles);
+                }
+            }
+        }
+
+        return files;
+    }
+
+    /// <summary>
+    /// Versao thread-safe que adiciona diretamente a uma ConcurrentBag
+    /// </summary>
+    private static void EnumerateFilesWithWin32Api(string path, string pattern, ConcurrentBag<FileHandleInfo> results, ref int fileCount)
+    {
+        var directoriesToProcess = new Stack<string>();
+        directoriesToProcess.Push(path);
+
+        while (directoriesToProcess.Count > 0)
+        {
+            var currentDir = directoriesToProcess.Pop();
+
+            // Primeiro, buscar subdiretorios
+            var searchPathDirs = Path.Combine(currentDir, "*");
+            var findHandleDirs = NativeMethods.FindFirstFileW(searchPathDirs, out var findDataDirs);
+
+            if (findHandleDirs != NativeMethods.INVALID_HANDLE_VALUE)
+            {
+                try
+                {
+                    do
+                    {
+                        if (findDataDirs.cFileName == "." || findDataDirs.cFileName == "..")
+                            continue;
+
+                        if ((findDataDirs.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0)
+                        {
+                            directoriesToProcess.Push(Path.Combine(currentDir, findDataDirs.cFileName));
+                        }
+                    } while (NativeMethods.FindNextFileW(findHandleDirs, out findDataDirs));
+                }
+                finally
+                {
+                    NativeMethods.FindClose(findHandleDirs);
+                }
+            }
+
+            // Depois, buscar arquivos com o pattern
+            var searchPathFiles = Path.Combine(currentDir, pattern);
+            var findHandleFiles = NativeMethods.FindFirstFileW(searchPathFiles, out var findDataFiles);
+
+            if (findHandleFiles != NativeMethods.INVALID_HANDLE_VALUE)
+            {
+                try
+                {
+                    do
+                    {
+                        if ((findDataFiles.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) == 0)
+                        {
+                            var filePath = Path.Combine(currentDir, findDataFiles.cFileName);
+                            if (TryExtractHandle(filePath, out var handle, out var fileName))
+                            {
+                                results.Add(new FileHandleInfo(filePath, fileName, handle));
+                                Interlocked.Increment(ref fileCount);
+                            }
+                        }
+                    } while (NativeMethods.FindNextFileW(findHandleFiles, out findDataFiles));
+                }
+                finally
+                {
+                    NativeMethods.FindClose(findHandleFiles);
+                }
+            }
+        }
     }
 
     private void ExportResults(string filePath)
