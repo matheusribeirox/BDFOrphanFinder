@@ -404,6 +404,7 @@ public partial class MainForm : Form
     private ComboBox cmbSearchMethod = null!;
     private NumericUpDown numParallelism = null!;
     private TextBox txtBackupPath = null!;
+    private CheckBox chkRemoveAfterBackup = null!;
     private Button btnBrowse = null!;
     private Button btnBrowseBackup = null!;
     private Button btnStart = null!;
@@ -594,6 +595,20 @@ public partial class MainForm : Form
         btnBrowseBackup.FlatAppearance.MouseOverBackColor = Color.FromArgb(240, 240, 240);
         btnBrowseBackup.Click += BtnBrowseBackup_Click;
         configPanel.Controls.Add(btnBrowseBackup, 2, 5);
+
+        // Checkbox para remover após backup (na coluna 3, ao lado do botão ...)
+        chkRemoveAfterBackup = new CheckBox
+        {
+            Text = "Remover orfaos",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(10, 6, 3, 0),
+            ForeColor = Color.FromArgb(180, 0, 0),
+            Font = labelFont,
+            Cursor = Cursors.Hand
+        };
+        configPanel.Controls.Add(chkRemoveAfterBackup, 3, 5);
+        configPanel.SetColumnSpan(chkRemoveAfterBackup, 2);
 
         // Row 6: Buttons
         var buttonPanel = new FlowLayoutPanel
@@ -829,6 +844,14 @@ public partial class MainForm : Form
             return false;
         }
 
+        // Se checkbox de remover após backup está marcado, o caminho de backup é obrigatório
+        if (chkRemoveAfterBackup.Checked && string.IsNullOrWhiteSpace(txtBackupPath.Text))
+        {
+            MessageBox.Show("Para remover orfaos apos backup, e necessario configurar um caminho de backup valido.", "Validacao",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
         return true;
     }
 
@@ -1001,8 +1024,35 @@ public partial class MainForm : Form
         // FASE 3: Backup dos arquivos órfãos (se configurado)
         // ================================================================
         var backupPath = txtBackupPath.Text;
+        var shouldRemoveOrphans = false;
+        var filesRemoved = 0;
+        var removeErrors = 0;
+
         if (!string.IsNullOrWhiteSpace(backupPath) && !_orphanFiles.IsEmpty)
         {
+            // Se checkbox de remoção está marcado, pedir confirmação
+            if (chkRemoveAfterBackup.Checked)
+            {
+                var confirmResult = MessageBox.Show(
+                    $"Foram encontrados {_orphanFiles.Count} arquivos orfaos ({FormatSize(_totalOrphanSize)}).\n\n" +
+                    $"Os arquivos serao copiados para:\n{backupPath}\n\n" +
+                    "ATENCAO: Apos o backup, os arquivos originais serao REMOVIDOS do BDOC!\n\n" +
+                    "Deseja continuar com o backup e remocao?",
+                    "Confirmacao de Remocao",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+
+                if (confirmResult != DialogResult.Yes)
+                {
+                    Log("Operacao de backup/remocao cancelada pelo usuario.", Color.Yellow);
+                    // Pular para o relatório final
+                    goto FinalReport;
+                }
+
+                shouldRemoveOrphans = true;
+            }
+
             Log("");
             Log("=== FASE 3: Backup dos arquivos orfaos ===", Color.Cyan);
             var phase3Start = DateTime.Now;
@@ -1011,6 +1061,9 @@ public partial class MainForm : Form
             var copied = 0;
             var errors = 0;
             var totalOrphans = orphanList.Count;
+
+            // Lista de arquivos copiados com sucesso (para remoção posterior)
+            var successfullyCopied = new ConcurrentBag<string>();
 
             Log($"Copiando {totalOrphans} arquivos para: {backupPath}");
 
@@ -1026,6 +1079,9 @@ public partial class MainForm : Form
 
                         Directory.CreateDirectory(destDir);
                         File.Copy(orphan.FilePath, destPath, overwrite: false);
+
+                        // Marcar como copiado com sucesso
+                        successfullyCopied.Add(orphan.FilePath);
 
                         var done = Interlocked.Increment(ref copied);
                         if (done % 100 == 0 || done == totalOrphans)
@@ -1048,7 +1104,92 @@ public partial class MainForm : Form
 
             Log($"Backup concluido: {copied} copiados, {errors} erros", copied > 0 ? Color.Green : Color.Yellow);
             Log($"Fase 3 concluida em: {_phase3Duration:mm\\:ss\\.fff}", Color.Green);
+
+            // ================================================================
+            // FASE 4: Remoção dos arquivos órfãos do BDOC (se solicitado)
+            // ================================================================
+            if (shouldRemoveOrphans && !successfullyCopied.IsEmpty)
+            {
+                Log("");
+                Log("=== FASE 4: Remocao dos arquivos orfaos do BDOC ===", Color.Cyan);
+                var phase4Start = DateTime.Now;
+
+                var filesToRemove = successfullyCopied.ToList();
+                var totalToRemove = filesToRemove.Count;
+                var dirsRemoved = 0;
+
+                // Normalizar systemPaths para comparação (limite de deleção de pastas)
+                var normalizedSystemPaths = systemPaths.Select(p => p.TrimEnd('\\').ToUpperInvariant()).ToHashSet();
+
+                Log($"Removendo {totalToRemove} arquivos do BDOC...");
+
+                await Parallel.ForEachAsync(filesToRemove,
+                    new ParallelOptions { MaxDegreeOfParallelism = (int)numParallelism.Value, CancellationToken = ct },
+                    async (filePath, token) =>
+                    {
+                        try
+                        {
+                            // Deletar o arquivo
+                            File.Delete(filePath);
+                            var done = Interlocked.Increment(ref filesRemoved);
+
+                            // Tentar remover pastas vazias subindo até o diretório da tabela
+                            var currentDir = Path.GetDirectoryName(filePath);
+                            while (!string.IsNullOrEmpty(currentDir))
+                            {
+                                var normalizedCurrentDir = currentDir.TrimEnd('\\').ToUpperInvariant();
+
+                                // Parar se chegou no diretório do sistema (ex: B:\BDOC\2025-12\RH_PROD)
+                                // Não deletar a pasta da tabela nem acima
+                                var isSystemPath = normalizedSystemPaths.Any(sp =>
+                                    normalizedCurrentDir.Equals(sp) ||
+                                    normalizedCurrentDir.StartsWith(sp + "\\") &&
+                                    normalizedCurrentDir.Substring(sp.Length + 1).IndexOf('\\') == -1);
+
+                                if (isSystemPath || normalizedSystemPaths.Any(sp => sp.StartsWith(normalizedCurrentDir)))
+                                    break;
+
+                                try
+                                {
+                                    // Só deleta se estiver vazio
+                                    if (Directory.Exists(currentDir) && !Directory.EnumerateFileSystemEntries(currentDir).Any())
+                                    {
+                                        Directory.Delete(currentDir);
+                                        Interlocked.Increment(ref dirsRemoved);
+                                        currentDir = Path.GetDirectoryName(currentDir);
+                                    }
+                                    else
+                                    {
+                                        break; // Pasta não está vazia, parar
+                                    }
+                                }
+                                catch
+                                {
+                                    break; // Erro ao deletar pasta, parar
+                                }
+                            }
+
+                            if (done % 100 == 0 || done == totalToRemove)
+                            {
+                                UpdateProgress(done, totalToRemove, $"Fase 4: Removendo ({done}/{totalToRemove} arquivos)");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Interlocked.Increment(ref removeErrors);
+                            Log($"  [ERRO REMOCAO] {Path.GetFileName(filePath)}: {ex.Message}", Color.Yellow);
+                        }
+
+                        await Task.CompletedTask;
+                    });
+
+                var phase4Duration = DateTime.Now - phase4Start;
+                Log($"Remocao concluida: {filesRemoved} arquivos, {dirsRemoved} pastas vazias, {removeErrors} erros", filesRemoved > 0 ? Color.Green : Color.Yellow);
+                Log($"Fase 4 concluida em: {phase4Duration:mm\\:ss\\.fff}", Color.Green);
+            }
         }
+
+        FinalReport:
 
         // Final report
         var elapsed = DateTime.Now - startTime;
@@ -1066,6 +1207,10 @@ public partial class MainForm : Form
         if (_totalFilesCopied > 0 || _totalCopyErrors > 0)
         {
             Log($"Backup: {_totalFilesCopied} copiados, {_totalCopyErrors} erros", Color.Cyan);
+        }
+        if (filesRemoved > 0 || removeErrors > 0)
+        {
+            Log($"Remocao: {filesRemoved} removidos, {removeErrors} erros", Color.Cyan);
         }
         Log("");
         Log("--- METRICAS DE PERFORMANCE ---", Color.Cyan);
