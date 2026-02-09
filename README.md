@@ -1,6 +1,6 @@
 # BDFOrphanFinder
 
-Ferramenta Windows para identificar arquivos BDF órfãos (sem registro correspondente no banco de dados) em estruturas de diretório BDOC do sistema Benner.
+Ferramenta Windows para identificar arquivos BDF órfãos (sem registro correspondente no banco de dados) em estruturas de diretório BDOC.
 
 ## Bancos de dados suportados
 
@@ -15,7 +15,7 @@ Com o tempo, arquivos `.BDF` podem se acumular nos diretórios BDOC sem possuir 
 
 O processo ocorre em fases:
 
-1. **Configuração automática**: O usuário informa o servidor de aplicação Benner. A ferramenta conecta via TCP (portas 5331 e 5337) para obter automaticamente as connection strings, descobrir os diretórios BDOC e listar os sistemas disponíveis.
+1. **Configuração automática**: O usuário informa o servidor de aplicação. A ferramenta conecta automaticamente para obter as connection strings, descobrir os diretórios BDOC e listar os sistemas disponíveis.
 2. **Fase 1 - Enumeração de arquivos**: Percorre os diretórios BDOC buscando arquivos `*.BDF` e extrai o handle numérico do nome de cada arquivo (formato `<nome>_<handle>.BDF`).
 3. **Fase 2 - Validação no banco**: Compara os handles extraídos contra a tabela correspondente no banco de dados. Arquivos cujo handle não existe no banco são marcados como órfãos.
 4. **Fase 3 - Backup (opcional)**: Se um caminho de backup for informado, copia os arquivos órfãos preservando a estrutura de diretórios.
@@ -25,28 +25,11 @@ Ao final, um relatório `.txt` é gerado automaticamente na pasta do executável
 
 ## Autoconfiguração via Servidor de Aplicação
 
-A ferramenta se conecta automaticamente ao servidor de aplicação Benner para obter as informações de conexão com o banco de dados:
-
-1. **Porta 5331** - Obtém a connection string do BSERVER
-   - Comando: `getssdbadonetconnectionstring`
-   - Consulta sistemas: `SELECT NAME FROM SYS_SYSTEMS WHERE LICINFO IS NOT NULL`
-   - Consulta diretórios BDOC: `SELECT NAME, DATA FROM SER_SERVICEPARAMS WHERE NAME IN ('SECDIR','PARDIR') AND SERVICE = 4`
-
-2. **Porta 5337** - Obtém a connection string do sistema selecionado
-   - Autenticação: `user internal benner`
-   - Seleção: `selectsystem <nome_sistema>`
-   - Comando: `getadonetconnectionstring`
-
-O tipo de banco (SQL Server ou Oracle) é detectado automaticamente pela connection string retornada.
+A ferramenta se conecta automaticamente ao servidor de aplicação para obter as informações de conexão com o banco de dados e descobrir os diretórios BDOC configurados. O tipo de banco (SQL Server ou Oracle) é detectado automaticamente pela connection string retornada.
 
 ### Descoberta automática de diretórios BDOC
 
-Ao conectar, a ferramenta consulta a tabela `SER_SERVICEPARAMS` do BSERVER para descobrir automaticamente os diretórios BDOC configurados:
-
-- **PARDIR**: Diretório primário do BDOC
-- **SECDIR**: Diretórios secundários (podem ser múltiplos, separados por `;`)
-
-Se os caminhos forem UNC (ex: `\\SERVIDOR\BDOC\...`) e o servidor for a máquina local, a ferramenta resolve automaticamente para o caminho local do compartilhamento via WMI, priorizando acesso local para melhor performance.
+Ao conectar, a ferramenta descobre automaticamente os diretórios BDOC configurados no servidor (primário e secundários). Se os caminhos forem UNC (ex: `\\SERVIDOR\BDOC\...`) e o servidor for a máquina local, a ferramenta resolve automaticamente para o caminho local do compartilhamento via WMI, priorizando acesso local para melhor performance.
 
 ### Busca do sistema em dois níveis
 
@@ -68,7 +51,7 @@ Isso garante compatibilidade com diferentes estruturas de organização do BDOC.
 
 - Windows (x64)
 - Acesso de leitura ao diretório BDOC
-- Acesso de rede ao servidor de aplicação Benner (portas 5331 e 5337)
+- Acesso de rede ao servidor de aplicação
 - **Para MFT**: Execução como Administrador
 
 ### Para build a partir do código-fonte
@@ -100,10 +83,10 @@ publish/BDFOrphanFinder.exe
 1. Executar `BDFOrphanFinder.exe` (como Administrador se usar MFT)
 2. Preencher os campos:
    - **Diretório BDOC**: Preenchido automaticamente ao conectar (pode ser alterado manualmente)
-   - **Serv. Aplicação**: IP ou nome do servidor de aplicação Benner
+   - **Serv. Aplicação**: IP ou nome do servidor de aplicação
 3. Clicar em **Conectar** para:
    - Obter as connection strings automaticamente
-   - Descobrir os diretórios BDOC configurados no BSERVER
+   - Descobrir os diretórios BDOC configurados
    - Carregar os sistemas disponíveis
 4. Selecionar o **Sistema** no ComboBox
 5. Configurar:
@@ -176,7 +159,3 @@ BDFOrphanFinder/
 - `System.Data.SqlClient` 4.8.6 (conexão SQL Server)
 - `Oracle.ManagedDataAccess.Core` 23.x (conexão Oracle)
 - `System.Management` 8.0.0 (resolução de caminhos UNC para locais via WMI)
-
-## Autor
-
-Benner
