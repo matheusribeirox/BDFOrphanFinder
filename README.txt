@@ -11,6 +11,7 @@ REQUISITOS:
 -----------
 - Windows 10/11 (x64)
 - .NET 6.0 SDK ou superior (para compilar)
+- Acesso de rede ao servidor de aplicacao Benner (portas 5331 e 5337)
 - Execucao como Administrador (para metodo MFT)
 
 COMO COMPILAR:
@@ -24,21 +25,26 @@ COMO USAR:
 1. Execute BDFOrphanFinder.exe (como Administrador se usar MFT)
 2. Preencha os campos:
    - Diretorio BDOC: Caminho base do BDOC (ex: B:\bdoc)
-   - Sistema: Nome do sistema a processar (ex: SISCON)
-   - Tipo Banco: SQL Server ou Oracle
-   - Servidor: Endereco do servidor de banco de dados
-   - Banco de Dados / Service Name: Nome do banco (SQL) ou Service Name (Oracle)
-   - Porta: Porta do Oracle (apenas Oracle, padrao 1521)
-   - Usuario: Usuario do banco de dados
-   - Senha: Senha do usuario
+   - Serv. Aplicacao: IP ou nome do servidor de aplicacao Benner
+3. Clique em "Conectar" para carregar os sistemas disponiveis
+4. Selecione o Sistema no ComboBox
+5. Configure:
    - Metodo de Busca: MFT (requer Admin) ou .NET EnumerateFiles
    - Threads: Grau de paralelismo
    - Caminho Backup BDF: (opcional) Diretorio para copiar orfaos
    - Remover orfaos: (opcional) Remove arquivos do BDOC apos backup
-3. Clique em "Iniciar" para comecar o processamento
-4. Se "Remover orfaos" estiver marcado, confirme a operacao quando solicitado
-5. Acompanhe o progresso no log em tempo real
-6. O relatorio e gerado automaticamente ao final
+6. Clique em "Iniciar" para comecar o processamento
+7. Se "Remover orfaos" estiver marcado, confirme a operacao quando solicitado
+8. Acompanhe o progresso no log em tempo real
+9. O relatorio e gerado automaticamente ao final
+
+AUTO-CONFIGURACAO:
+------------------
+A ferramenta conecta automaticamente ao servidor de aplicacao Benner:
+- Porta 5331: Obtem connection string do BSERVER para listar sistemas
+- Porta 5337: Obtem connection string do sistema selecionado
+- Tipo de banco (SQL Server/Oracle) detectado automaticamente
+- Nao e necessario informar servidor de banco, usuario ou senha
 
 METODOS DE BUSCA:
 -----------------
@@ -50,7 +56,8 @@ METODOS DE BUSCA:
 
 RECURSOS:
 ---------
-- Suporte a SQL Server e Oracle
+- Auto-configuracao via servidor de aplicacao Benner
+- Suporte a SQL Server e Oracle (deteccao automatica)
 - Interface grafica intuitiva
 - Barra de progresso em tempo real
 - Log detalhado do processamento

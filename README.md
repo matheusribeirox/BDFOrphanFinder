@@ -15,12 +15,28 @@ Com o tempo, arquivos `.BDF` podem se acumular nos diretorios BDOC sem possuir u
 
 O processo ocorre em fases:
 
-1. **Fase 1 - Enumeracao de arquivos**: Percorre os diretorios BDOC buscando arquivos `*.BDF` e extrai o handle numerico do nome de cada arquivo (formato `<nome>_<handle>.BDF`).
-2. **Fase 2 - Validacao no banco**: Compara os handles extraidos contra a tabela correspondente no banco de dados. Arquivos cujo handle nao existe no banco sao marcados como orfaos.
-3. **Fase 3 - Backup (opcional)**: Se um caminho de backup for informado, copia os arquivos orfaos preservando a estrutura de diretorios.
-4. **Fase 4 - Remocao (opcional)**: Se a opcao "Remover orfaos" estiver marcada, remove os arquivos do BDOC apos o backup bem-sucedido, incluindo as pastas vazias no caminho.
+1. **Configuracao automatica**: O usuario informa o servidor de aplicacao Benner. A ferramenta conecta via TCP (portas 5331 e 5337) para obter automaticamente as connection strings e listar os sistemas disponiveis.
+2. **Fase 1 - Enumeracao de arquivos**: Percorre os diretorios BDOC buscando arquivos `*.BDF` e extrai o handle numerico do nome de cada arquivo (formato `<nome>_<handle>.BDF`).
+3. **Fase 2 - Validacao no banco**: Compara os handles extraidos contra a tabela correspondente no banco de dados. Arquivos cujo handle nao existe no banco sao marcados como orfaos.
+4. **Fase 3 - Backup (opcional)**: Se um caminho de backup for informado, copia os arquivos orfaos preservando a estrutura de diretorios.
+5. **Fase 4 - Remocao (opcional)**: Se a opcao "Remover orfaos" estiver marcada, remove os arquivos do BDOC apos o backup bem-sucedido, incluindo as pastas vazias no caminho.
 
 Ao final, um relatorio `.txt` e gerado automaticamente na pasta do executavel.
+
+## Auto-configuracao via Servidor de Aplicacao
+
+A ferramenta se conecta automaticamente ao servidor de aplicacao Benner para obter as informacoes de conexao com o banco de dados:
+
+1. **Porta 5331** - Obtem a connection string do BSERVER para listar sistemas disponiveis
+   - Comando: `getssdbadonetconnectionstring`
+   - Consulta: `SELECT NAME FROM SYS_SYSTEMS WHERE LICINFO IS NOT NULL`
+
+2. **Porta 5337** - Obtem a connection string do sistema selecionado
+   - Autenticacao: `user internal benner`
+   - Selecao: `selectsystem <nome_sistema>`
+   - Comando: `getadonetconnectionstring`
+
+O tipo de banco (SQL Server ou Oracle) e detectado automaticamente pela connection string retornada.
 
 ## Estrategias de busca
 
@@ -33,7 +49,7 @@ Ao final, um relatorio `.txt` e gerado automaticamente na pasta do executavel.
 
 - Windows (x64)
 - Acesso de leitura ao diretorio BDOC
-- Acesso ao banco de dados (SQL Server ou Oracle) com permissao de SELECT
+- Acesso de rede ao servidor de aplicacao Benner (portas 5331 e 5337)
 - **Para MFT**: Execucao como Administrador
 
 ### Para build a partir do codigo-fonte
@@ -65,28 +81,18 @@ publish/BDFOrphanFinder.exe
 1. Executar `BDFOrphanFinder.exe` (como Administrador se usar MFT)
 2. Preencher os campos:
    - **Diretorio BDOC**: Caminho raiz do BDOC (ex: `B:\bdoc`)
-   - **Sistema**: Nome do sistema (ex: `SISCON`, `WES`)
-   - **Tipo Banco**: SQL Server ou Oracle
-   - **Servidor**: Endereco do servidor de banco de dados
-   - **Banco de Dados / Service Name**: Nome do banco (SQL Server) ou Service Name (Oracle)
-   - **Porta**: Porta do Oracle (apenas para Oracle, padrao 1521)
-   - **Usuario / Senha**: Credenciais do banco
+   - **Serv. Aplicacao**: IP ou nome do servidor de aplicacao Benner
+3. Clicar em **Conectar** para carregar os sistemas disponiveis
+4. Selecionar o **Sistema** no ComboBox
+5. Configurar:
    - **Metodo de Busca**: MFT ou .NET EnumerateFiles
    - **Threads**: Grau de paralelismo para validacao no banco
    - **Caminho Backup BDF** (opcional): Diretorio para copiar os orfaos encontrados
    - **Remover orfaos** (opcional): Se marcado, remove os arquivos do BDOC apos o backup
-3. Clicar em **Iniciar**
-4. Se "Remover orfaos" estiver marcado, uma confirmacao sera solicitada antes de prosseguir
+6. Clicar em **Iniciar**
+7. Se "Remover orfaos" estiver marcado, uma confirmacao sera solicitada antes de prosseguir
 
 As configuracoes sao salvas automaticamente em `settings.txt` na pasta do executavel.
-
-## Formato de conexao Oracle
-
-A conexao Oracle usa o formato TNS:
-
-```
-Data Source=(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=servidor)(PORT=1521)))(CONNECT_DATA=(SERVICE_NAME=nome_servico)));User Id=usuario;Password=senha;
-```
 
 ## Remocao de orfaos
 

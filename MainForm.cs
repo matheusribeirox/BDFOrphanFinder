@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Data.SqlClient;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using Oracle.ManagedDataAccess.Client;
@@ -10,34 +11,8 @@ namespace BDFOrphanFinder;
 #region Win32 API Interop
 internal static class NativeMethods
 {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct WIN32_FIND_DATA
-    {
-        public uint dwFileAttributes;
-        public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
-        public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
-        public uint nFileSizeHigh;
-        public uint nFileSizeLow;
-        public uint dwReserved0;
-        public uint dwReserved1;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-        public string cFileName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
-        public string cAlternateFileName;
-    }
-
     public const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
     public static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATA lpFindFileData);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern bool FindNextFileW(IntPtr hFindFile, out WIN32_FIND_DATA lpFindFileData);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool FindClose(IntPtr hFindFile);
 
     // ===== MFT (Master File Table) Access =====
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -124,9 +99,9 @@ internal static class MftScanner
     /// </summary>
     /// <param name="driveLetter">Letra do drive (ex: 'B')</param>
     /// <param name="extension">Extensão do arquivo (ex: ".BDF")</param>
-    /// <param name="basePath">Caminho base para filtrar. Se fornecido, apenas arquivos dentro deste path serão retornados.</param>
-    /// <param name="progressCallback">Callback de progresso</param>
-    /// <param name="memoryLimitBytes">Limite de memória em bytes</param>
+    /// <param name="basePath">Caminho base para filtrar (ex: "B:\bdoc"). Se null, retorna todos.</param>
+    /// <param name="progressCallback">Callback de progresso (número de registros processados)</param>
+    /// <param name="memoryLimitBytes">Limite de memória em bytes (padrão: 1.5GB)</param>
     public static List<MftFileInfo> ScanVolume(
         char driveLetter,
         string extension,
@@ -134,26 +109,8 @@ internal static class MftScanner
         Action<int>? progressCallback = null,
         long memoryLimitBytes = DEFAULT_MEMORY_LIMIT_BYTES)
     {
-        var files = new List<MftFileInfo>();
-
-        // Usar dicionário com capacidade inicial menor para economizar memória
-        // Se temos basePath, precisamos de muito menos entradas
-        var initialCapacity = string.IsNullOrEmpty(basePath) ? 500000 : 50000;
-        var directories = new Dictionary<long, DirectoryEntry>(initialCapacity);
-
-        // Preparar filtro de basePath
-        string[]? basePathParts = null;
-        if (!string.IsNullOrEmpty(basePath))
-        {
-            // Normalizar basePath: remover drive letter e separar em partes
-            // Ex: "B:\BDOC\sistema" -> ["BDOC", "sistema"]
-            var pathWithoutDrive = basePath.Length > 2 && basePath[1] == ':'
-                ? basePath.Substring(3)  // Remove "B:\"
-                : basePath;
-            basePathParts = pathWithoutDrive.Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
-        }
-
         var volumePath = $"\\\\.\\{driveLetter}:";
+
         var handle = NativeMethods.CreateFileW(
             volumePath,
             NativeMethods.GENERIC_READ,
@@ -165,32 +122,31 @@ internal static class MftScanner
 
         if (handle == NativeMethods.INVALID_HANDLE_VALUE)
         {
-            var error = Marshal.GetLastWin32Error();
-            throw new InvalidOperationException($"Nao foi possivel acessar o volume {driveLetter}:. Erro: {error}. Execute como Administrador.");
+            throw new InvalidOperationException(
+                $"Não foi possível abrir o volume {driveLetter}:. Verifique se está executando como Administrador.");
         }
+
+        var files = new List<MftFileInfo>();
+        var directories = new Dictionary<long, DirectoryEntry>();
+
+        long estimatedMemory = 0;
 
         try
         {
-            var mftData = new NativeMethods.MFT_ENUM_DATA_V0
-            {
-                StartFileReferenceNumber = 0,
-                LowUsn = 0,
-                HighUsn = long.MaxValue
-            };
-
-            const int bufferSize = 64 * 1024; // 64KB buffer (reduzido)
+            var bufferSize = 64 * 1024; // 64KB buffer
             var buffer = Marshal.AllocHGlobal(bufferSize);
-            var extUpper = extension.ToUpperInvariant().TrimStart('*');
-
-            // Cache de diretórios que estão no caminho do basePath (para otimização)
-            // Key: fileRef, Value: true se está no caminho ou é ancestral do basePath
-            HashSet<long>? relevantDirs = basePathParts != null ? new HashSet<long>() : null;
 
             try
             {
+                var mftData = new NativeMethods.MFT_ENUM_DATA_V0
+                {
+                    StartFileReferenceNumber = 0,
+                    LowUsn = 0,
+                    HighUsn = long.MaxValue
+                };
+
                 int recordCount = 0;
-                long estimatedMemoryUsage = 0;
-                bool memoryWarningLogged = false;
+                string extensionUpper = extension.ToUpperInvariant();
 
                 while (NativeMethods.DeviceIoControl(
                     handle,
@@ -204,69 +160,55 @@ internal static class MftScanner
                 {
                     if (bytesReturned <= 8) break;
 
-                    // Verificar limite de memória periodicamente
-                    if (recordCount % 50000 == 0)
-                    {
-                        estimatedMemoryUsage = (long)directories.Count * ESTIMATED_DIR_ENTRY_SIZE +
-                                              (long)files.Count * ESTIMATED_FILE_ENTRY_SIZE;
-
-                        if (estimatedMemoryUsage > memoryLimitBytes)
-                        {
-                            if (!memoryWarningLogged)
-                            {
-                                memoryWarningLogged = true;
-                            }
-
-                            // Limpar diretórios que provavelmente não serão usados
-                            if (directories.Count > 1000000)
-                            {
-                                CompactDirectories(directories, files);
-                            }
-                        }
-                    }
-
+                    // Primeiro 8 bytes = próximo USN
                     mftData.StartFileReferenceNumber = Marshal.ReadInt64(buffer, 0);
-                    int offset = 8;
 
+                    int offset = 8;
                     while (offset < bytesReturned)
                     {
-                        var recordLength = Marshal.ReadInt32(buffer, offset);
-                        if (recordLength == 0) break;
+                        var record = Marshal.PtrToStructure<NativeMethods.USN_RECORD>(buffer + offset);
+                        int recordLength = record.RecordLength;
+                        if (recordLength <= 0) break;
 
-                        var fileRef = Marshal.ReadInt64(buffer, offset + 8);
-                        var parentRef = Marshal.ReadInt64(buffer, offset + 16);
-                        var fileAttributes = (uint)Marshal.ReadInt32(buffer, offset + 52);
-                        var fileNameLength = Marshal.ReadInt16(buffer, offset + 56);
-                        var fileNameOffset = Marshal.ReadInt16(buffer, offset + 58);
+                        // Extrair nome do arquivo
+                        int nameLength = record.FileNameLength / 2;
+                        string fileName = Marshal.PtrToStringUni(
+                            buffer + offset + record.FileNameOffset,
+                            nameLength) ?? "";
 
-                        var fileName = Marshal.PtrToStringUni(buffer + offset + fileNameOffset, fileNameLength / 2);
-
-                        if (!string.IsNullOrEmpty(fileName) && fileName != "." && fileName != "..")
+                        if ((record.FileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0)
                         {
-                            var isDirectory = (fileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0;
+                            // É um diretório - armazenar para resolver caminhos depois
+                            directories[record.FileReferenceNumber] =
+                                new DirectoryEntry(fileName, record.ParentFileReferenceNumber);
 
-                            if (isDirectory)
+                            estimatedMemory += ESTIMATED_DIR_ENTRY_SIZE;
+                        }
+                        else if (fileName.EndsWith(extensionUpper, StringComparison.OrdinalIgnoreCase))
+                        {
+                            files.Add(new MftFileInfo
                             {
-                                // Se temos basePath, só armazenar diretórios que podem ser relevantes
-                                if (basePathParts != null)
-                                {
-                                    // Armazenar sempre - vamos filtrar depois na resolução de paths
-                                    // Mas com capacidade reduzida já economiza memória
-                                    directories[fileRef] = new DirectoryEntry(fileName, parentRef);
-                                }
-                                else
-                                {
-                                    directories[fileRef] = new DirectoryEntry(fileName, parentRef);
-                                }
-                            }
-                            else if (fileName.EndsWith(extUpper, StringComparison.OrdinalIgnoreCase))
+                                FileReferenceNumber = record.FileReferenceNumber,
+                                ParentFileReferenceNumber = record.ParentFileReferenceNumber,
+                                FileName = fileName
+                            });
+
+                            estimatedMemory += ESTIMATED_FILE_ENTRY_SIZE;
+                        }
+
+                        // Verificar limite de memória
+                        if (estimatedMemory > memoryLimitBytes)
+                        {
+                            // Compactar diretórios antes de lançar erro
+                            CompactDirectories(directories, files);
+                            estimatedMemory = (long)directories.Count * ESTIMATED_DIR_ENTRY_SIZE +
+                                            (long)files.Count * ESTIMATED_FILE_ENTRY_SIZE;
+
+                            if (estimatedMemory > memoryLimitBytes)
                             {
-                                files.Add(new MftFileInfo
-                                {
-                                    FileReferenceNumber = fileRef,
-                                    ParentFileReferenceNumber = parentRef,
-                                    FileName = fileName
-                                });
+                                throw new OutOfMemoryException(
+                                    $"Limite de memória atingido ({memoryLimitBytes / (1024 * 1024)} MB). " +
+                                    $"Dirs: {directories.Count:N0}, Arquivos: {files.Count:N0}");
                             }
                         }
 
@@ -329,9 +271,6 @@ internal static class MftScanner
             NativeMethods.CloseHandle(handle);
         }
 
-        // Forçar GC para liberar memória
-        GC.Collect(2, GCCollectionMode.Optimized);
-
         return files;
     }
 
@@ -358,7 +297,6 @@ internal static class MftScanner
         }
 
         directories.TrimExcess();
-        GC.Collect(1, GCCollectionMode.Optimized);
     }
 
     private static string BuildPath(string fileName, long parentRef, Dictionary<long, DirectoryEntry> directories)
@@ -394,18 +332,14 @@ internal class MftFileInfo
 public partial class MainForm : Form
 {
     private TextBox txtBdocPath = null!;
-    private TextBox txtSystemName = null!;
-    private ComboBox cmbDatabaseType = null!;
-    private TextBox txtServer = null!;
-    private TextBox txtDatabase = null!;
-    private TextBox txtPort = null!;
-    private TextBox txtUsername = null!;
-    private TextBox txtPassword = null!;
+    private TextBox txtAppServer = null!;
+    private ComboBox cmbSistema = null!;
     private ComboBox cmbSearchMethod = null!;
     private NumericUpDown numParallelism = null!;
     private TextBox txtBackupPath = null!;
     private CheckBox chkRemoveAfterBackup = null!;
     private Button btnBrowse = null!;
+    private Button btnConectar = null!;
     private Button btnBrowseBackup = null!;
     private Button btnStart = null!;
     private Button btnCancel = null!;
@@ -414,10 +348,12 @@ public partial class MainForm : Form
     private Label lblProgress = null!;
     private RichTextBox txtLog = null!;
 
-    // Labels que mudam dinamicamente conforme o tipo de banco
-    private Label lblServer = null!;
-    private Label lblDatabase = null!;
-    private Label lblPort = null!;
+    // Constantes
+    private const int PROGRESS_UPDATE_INTERVAL = 100;
+    private const int DB_COMMAND_TIMEOUT = 120;
+    private const int ORACLE_BATCH_SIZE = 1000;
+    private const int SQLSERVER_BATCH_SIZE = 2000;
+    private const int TELNET_TIMEOUT_MS = 10000;
 
     private CancellationTokenSource? _cts;
     private ConcurrentBag<OrphanFile> _orphanFiles = new();
@@ -433,7 +369,12 @@ public partial class MainForm : Form
     private int _totalFilesCopied = 0;
     private int _totalCopyErrors = 0;
 
-    private bool IsOracle => cmbDatabaseType.SelectedIndex == 1;
+    // Tipo de banco detectado automaticamente via connection string
+    private bool _isOracle = false;
+    private bool IsOracle => _isOracle;
+
+    // Diretórios BDOC obtidos do BSERVER (PARDIR + SECDIR)
+    private List<string> _bdocPaths = new();
 
     public MainForm()
     {
@@ -443,7 +384,7 @@ public partial class MainForm : Form
 
     private void InitializeComponent()
     {
-        this.Text = "Identificador de Arquivos BDF Orfaos";
+        this.Text = "Identificador de Arquivos BDF Órfãos";
         this.Size = new Size(900, 750);
         this.MinimumSize = new Size(800, 650);
         this.StartPosition = FormStartPosition.CenterScreen;
@@ -465,7 +406,7 @@ public partial class MainForm : Form
         // ===== CONFIG PANEL =====
         var configGroup = new GroupBox
         {
-            Text = "Configuracoes",
+            Text = "Configurações",
             Dock = DockStyle.Fill,
             AutoSize = true,
             Padding = new Padding(15, 20, 15, 10),
@@ -479,7 +420,7 @@ public partial class MainForm : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             ColumnCount = 6,
-            RowCount = 8,
+            RowCount = 6,
             BackColor = Color.White
         };
         configPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));  // Col 0: Label
@@ -496,8 +437,8 @@ public partial class MainForm : Form
         var labelMarginRight = new Padding(10, 8, 3, 0);
         var textBoxFont = new Font("Segoe UI", 9.5f);
 
-        // Row 0: BDOC Path + Sistema
-        configPanel.Controls.Add(new Label { Text = "Diretorio BDOC:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 0);
+        // Row 0: BDOC Path + Servidor de Aplicação
+        configPanel.Controls.Add(new Label { Text = "Diretório BDOC:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 0);
         txtBdocPath = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
         configPanel.Controls.Add(txtBdocPath, 1, 0);
         btnBrowse = new Button
@@ -511,13 +452,26 @@ public partial class MainForm : Form
         btnBrowse.FlatAppearance.MouseOverBackColor = Color.FromArgb(240, 240, 240);
         btnBrowse.Click += BtnBrowse_Click;
         configPanel.Controls.Add(btnBrowse, 2, 0);
-        configPanel.Controls.Add(new Label { Text = "Sistema:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 0);
-        txtSystemName = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtSystemName, 4, 0);
+        configPanel.Controls.Add(new Label { Text = "Serv. Aplicação:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 0);
+        txtAppServer = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
+        configPanel.Controls.Add(txtAppServer, 4, 0);
+        btnConectar = new Button
+        {
+            Text = "Conectar", Width = 70, Height = 26,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(0, 120, 212),
+            ForeColor = Color.White,
+            Font = new Font("Segoe UI Semibold", 8.5f),
+            Cursor = Cursors.Hand
+        };
+        btnConectar.FlatAppearance.BorderSize = 0;
+        btnConectar.FlatAppearance.MouseOverBackColor = Color.FromArgb(0, 100, 180);
+        btnConectar.Click += BtnConectar_Click;
+        configPanel.Controls.Add(btnConectar, 5, 0);
 
-        // Row 1: Tipo Banco + Servidor
-        configPanel.Controls.Add(new Label { Text = "Tipo Banco:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 1);
-        cmbDatabaseType = new ComboBox
+        // Row 1: Sistema (ComboBox populado automaticamente)
+        configPanel.Controls.Add(new Label { Text = "Sistema:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 1);
+        cmbSistema = new ComboBox
         {
             Dock = DockStyle.Fill,
             DropDownStyle = ComboBoxStyle.DropDownList,
@@ -525,35 +479,11 @@ public partial class MainForm : Form
             BackColor = Color.White,
             Font = textBoxFont
         };
-        cmbDatabaseType.Items.AddRange(new object[] { "SQL Server", "Oracle" });
-        cmbDatabaseType.SelectedIndex = 0;
-        cmbDatabaseType.SelectedIndexChanged += CmbDatabaseType_SelectedIndexChanged;
-        configPanel.Controls.Add(cmbDatabaseType, 1, 1);
-        lblServer = new Label { Text = "Servidor SQL:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont };
-        configPanel.Controls.Add(lblServer, 3, 1);
-        txtServer = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtServer, 4, 1);
+        configPanel.Controls.Add(cmbSistema, 1, 1);
+        configPanel.SetColumnSpan(cmbSistema, 4);
 
-        // Row 2: Database/Service Name + Port
-        lblDatabase = new Label { Text = "Banco de Dados:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont };
-        configPanel.Controls.Add(lblDatabase, 0, 2);
-        txtDatabase = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtDatabase, 1, 2);
-        lblPort = new Label { Text = "Porta:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont, Visible = false };
-        configPanel.Controls.Add(lblPort, 3, 2);
-        txtPort = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont, Text = "1521", Visible = false };
-        configPanel.Controls.Add(txtPort, 4, 2);
-
-        // Row 3: Username + Password
-        configPanel.Controls.Add(new Label { Text = "Usuario:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 3);
-        txtUsername = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtUsername, 1, 3);
-        configPanel.Controls.Add(new Label { Text = "Senha:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 3);
-        txtPassword = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtPassword, 4, 3);
-
-        // Row 4: Search Method + Parallelism
-        configPanel.Controls.Add(new Label { Text = "Metodo de Busca:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 4);
+        // Row 2: Search Method + Parallelism
+        configPanel.Controls.Add(new Label { Text = "Método de Busca:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 2);
         cmbSearchMethod = new ComboBox
         {
             Dock = DockStyle.Fill,
@@ -565,9 +495,9 @@ public partial class MainForm : Form
         // 0 = MFT (Master File Table), 1 = .NET EnumerateFiles
         cmbSearchMethod.Items.AddRange(new object[] { "MFT (Master File Table)", ".NET EnumerateFiles" });
         cmbSearchMethod.SelectedIndex = 0;
-        configPanel.Controls.Add(cmbSearchMethod, 1, 4);
+        configPanel.Controls.Add(cmbSearchMethod, 1, 2);
 
-        configPanel.Controls.Add(new Label { Text = "Threads:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 4);
+        configPanel.Controls.Add(new Label { Text = "Threads:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginRight, ForeColor = labelColor, Font = labelFont }, 3, 2);
         numParallelism = new NumericUpDown
         {
             Minimum = 1,
@@ -578,12 +508,12 @@ public partial class MainForm : Form
             BackColor = Color.White,
             Font = textBoxFont
         };
-        configPanel.Controls.Add(numParallelism, 4, 4);
+        configPanel.Controls.Add(numParallelism, 4, 2);
 
-        // Row 5: Backup Path
-        configPanel.Controls.Add(new Label { Text = "Caminho Backup BDF:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 5);
+        // Row 3: Backup Path
+        configPanel.Controls.Add(new Label { Text = "Caminho Backup BDF:", AutoSize = true, Anchor = AnchorStyles.Left, Margin = labelMarginLeft, ForeColor = labelColor, Font = labelFont }, 0, 3);
         txtBackupPath = new TextBox { Dock = DockStyle.Fill, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.White, Font = textBoxFont };
-        configPanel.Controls.Add(txtBackupPath, 1, 5);
+        configPanel.Controls.Add(txtBackupPath, 1, 3);
         btnBrowseBackup = new Button
         {
             Text = "...", Width = 32, Height = 26,
@@ -594,12 +524,12 @@ public partial class MainForm : Form
         btnBrowseBackup.FlatAppearance.BorderSize = 1;
         btnBrowseBackup.FlatAppearance.MouseOverBackColor = Color.FromArgb(240, 240, 240);
         btnBrowseBackup.Click += BtnBrowseBackup_Click;
-        configPanel.Controls.Add(btnBrowseBackup, 2, 5);
+        configPanel.Controls.Add(btnBrowseBackup, 2, 3);
 
-        // Checkbox para remover após backup (na coluna 3, ao lado do botão ...)
+        // Checkbox para remover após backup
         chkRemoveAfterBackup = new CheckBox
         {
-            Text = "Remover orfaos",
+            Text = "Remover órfãos",
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(10, 6, 3, 0),
@@ -607,10 +537,10 @@ public partial class MainForm : Form
             Font = labelFont,
             Cursor = Cursors.Hand
         };
-        configPanel.Controls.Add(chkRemoveAfterBackup, 3, 5);
+        configPanel.Controls.Add(chkRemoveAfterBackup, 3, 3);
         configPanel.SetColumnSpan(chkRemoveAfterBackup, 2);
 
-        // Row 6: Buttons
+        // Row 4: Buttons
         var buttonPanel = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -651,7 +581,7 @@ public partial class MainForm : Form
         buttonPanel.Controls.Add(btnStart);
         buttonPanel.Controls.Add(btnCancel);
 
-        configPanel.Controls.Add(buttonPanel, 1, 6);
+        configPanel.Controls.Add(buttonPanel, 1, 4);
         configPanel.SetColumnSpan(buttonPanel, 4);
 
         configGroup.Controls.Add(configPanel);
@@ -708,29 +638,11 @@ public partial class MainForm : Form
         this.Controls.Add(mainPanel);
     }
 
-    private void CmbDatabaseType_SelectedIndexChanged(object? sender, EventArgs e)
-    {
-        if (IsOracle)
-        {
-            lblServer.Text = "Servidor Oracle:";
-            lblDatabase.Text = "Service Name:";
-            lblPort.Visible = true;
-            txtPort.Visible = true;
-        }
-        else
-        {
-            lblServer.Text = "Servidor SQL:";
-            lblDatabase.Text = "Banco de Dados:";
-            lblPort.Visible = false;
-            txtPort.Visible = false;
-        }
-    }
-
     private void BtnBrowse_Click(object? sender, EventArgs e)
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Selecione o diretorio base do BDOC",
+            Description = "Selecione o diretório base do BDOC",
             UseDescriptionForTitle = true
         };
 
@@ -744,13 +656,308 @@ public partial class MainForm : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Selecione o diretorio de backup dos BDF orfaos",
+            Description = "Selecione o diretório de backup dos BDF órfãos",
             UseDescriptionForTitle = true
         };
 
         if (dialog.ShowDialog() == DialogResult.OK)
         {
             txtBackupPath.Text = dialog.SelectedPath;
+        }
+    }
+
+    // ===== Comunicação Telnet com Servidor de Aplicação =====
+
+    private async Task<string> SendTelnetCommandAsync(string server, int port, string command, CancellationToken ct)
+    {
+        using var client = new TcpClient();
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TELNET_TIMEOUT_MS);
+
+        await client.ConnectAsync(server, port, timeoutCts.Token);
+        using var stream = client.GetStream();
+
+        var data = Encoding.ASCII.GetBytes(command + "\r\n");
+        await stream.WriteAsync(data, timeoutCts.Token);
+
+        // Ler resposta
+        var buffer = new byte[8192];
+        var response = new StringBuilder();
+
+        while (true)
+        {
+            var bytesRead = await stream.ReadAsync(buffer, timeoutCts.Token);
+            if (bytesRead == 0) break;
+            response.Append(Encoding.ASCII.GetString(buffer, 0, bytesRead));
+            if (response.ToString().Contains("\n")) break;
+        }
+        return response.ToString().Trim();
+    }
+
+    private async Task<string> SendCommandOnStreamAsync(NetworkStream stream, string command, CancellationToken ct)
+    {
+        var data = Encoding.ASCII.GetBytes(command + "\r\n");
+        await stream.WriteAsync(data, ct);
+
+        var buffer = new byte[8192];
+        var response = new StringBuilder();
+
+        while (true)
+        {
+            var bytesRead = await stream.ReadAsync(buffer, ct);
+            if (bytesRead == 0) break;
+            response.Append(Encoding.ASCII.GetString(buffer, 0, bytesRead));
+            if (response.ToString().Contains("\n")) break;
+        }
+        return response.ToString().Trim();
+    }
+
+    private async Task SendAndExpectAsync(NetworkStream stream, string command, string expectedPrefix, CancellationToken ct)
+    {
+        var response = await SendCommandOnStreamAsync(stream, command, ct);
+        if (!response.StartsWith(expectedPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Resposta inesperada do servidor.\nComando: {command}\nEsperado: {expectedPrefix}\nRecebido: {response}");
+        }
+    }
+
+    private async Task<string> GetBserverConnectionStringAsync(string server, CancellationToken ct)
+    {
+        var response = await SendTelnetCommandAsync(server, 5331, "getssdbadonetconnectionstring", ct);
+        // Remover prefixo "+ "
+        if (response.StartsWith("+ "))
+            return response.Substring(2);
+        if (response.StartsWith("+"))
+            return response.Substring(1).TrimStart();
+        return response;
+    }
+
+    private async Task<string> GetSystemConnectionStringAsync(string server, string systemName, CancellationToken ct)
+    {
+        using var client = new TcpClient();
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TELNET_TIMEOUT_MS);
+
+        await client.ConnectAsync(server, 5337, timeoutCts.Token);
+        using var stream = client.GetStream();
+
+        // 1. Autenticar
+        await SendAndExpectAsync(stream, "user internal benner", "+", timeoutCts.Token);
+
+        // 2. Selecionar sistema
+        await SendAndExpectAsync(stream, $"selectsystem {systemName}", "+", timeoutCts.Token);
+
+        // 3. Obter connection string
+        var response = await SendCommandOnStreamAsync(stream, "getadonetconnectionstring", timeoutCts.Token);
+
+        // Remover prefixo "+ "
+        if (response.StartsWith("+ "))
+            return response.Substring(2);
+        if (response.StartsWith("+"))
+            return response.Substring(1).TrimStart();
+        return response;
+    }
+
+    private (bool isOracle, string connectionString) ParseReceivedConnectionString(string raw)
+    {
+        bool isOracle = raw.Contains("(DESCRIPTION=", StringComparison.OrdinalIgnoreCase);
+        return (isOracle, raw);
+    }
+
+    private async Task<List<string>> QueryAvailableSystemsAsync(string connectionString, bool isOracle, CancellationToken ct)
+    {
+        var systems = new List<string>();
+
+        DbConnection connection = isOracle
+            ? new OracleConnection(connectionString)
+            : new SqlConnection(connectionString);
+
+        using (connection)
+        {
+            await connection.OpenAsync(ct);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = isOracle
+                ? "SELECT NAME FROM \"SYS_SYSTEMS\" WHERE LICINFO IS NOT NULL"
+                : "SELECT NAME FROM [SYS_SYSTEMS] WITH (NOLOCK) WHERE LICINFO IS NOT NULL";
+            cmd.CommandTimeout = DB_COMMAND_TIMEOUT;
+
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                if (!reader.IsDBNull(0))
+                    systems.Add(reader.GetString(0));
+            }
+        }
+
+        return systems;
+    }
+
+    private async Task<List<string>> QueryBdocPathsAsync(string connectionString, bool isOracle, CancellationToken ct)
+    {
+        var paths = new List<string>();
+
+        DbConnection connection = isOracle
+            ? new OracleConnection(connectionString)
+            : new SqlConnection(connectionString);
+
+        using (connection)
+        {
+            await connection.OpenAsync(ct);
+
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = isOracle
+                ? "SELECT NAME, DATA FROM \"SER_SERVICEPARAMS\" WHERE NAME IN ('SECDIR','PARDIR') AND SERVICE = 4"
+                : "SELECT NAME, DATA FROM [SER_SERVICEPARAMS] WITH (NOLOCK) WHERE NAME IN ('SECDIR','PARDIR') AND SERVICE = 4";
+            cmd.CommandTimeout = DB_COMMAND_TIMEOUT;
+
+            using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                if (!reader.IsDBNull(1))
+                {
+                    var data = reader.GetString(1);
+                    // DATA pode conter múltiplos caminhos separados por ;
+                    foreach (var path in data.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var trimmed = path.Trim().TrimEnd('\\');
+                        if (!string.IsNullOrWhiteSpace(trimmed))
+                            paths.Add(trimmed);
+                    }
+                }
+            }
+        }
+
+        var distinct = paths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        // Tentar converter caminhos UNC para locais quando o servidor é a máquina atual
+        var result = new List<string>();
+        foreach (var p in distinct)
+        {
+            var local = TryResolveUncToLocal(p);
+            result.Add(local ?? p);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Se o caminho UNC aponta para a máquina atual, resolve para o caminho local do compartilhamento.
+    /// Ex: \\MAQUINA\BDOC\subdir -> D:\BDOC\subdir (se o share BDOC aponta para D:\BDOC)
+    /// </summary>
+    private string? TryResolveUncToLocal(string uncPath)
+    {
+        if (!uncPath.StartsWith("\\\\")) return null;
+
+        // Extrair servidor e share do caminho UNC
+        var parts = uncPath.TrimStart('\\').Split('\\', 3);
+        if (parts.Length < 2) return null;
+
+        var server = parts[0];
+        var shareName = parts[1];
+        var remainder = parts.Length > 2 ? parts[2] : "";
+
+        // Verificar se o servidor UNC é a máquina atual
+        var machineName = Environment.MachineName;
+        if (!server.Equals(machineName, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        // Consultar o caminho local do compartilhamento via WMI
+        try
+        {
+            using var searcher = new System.Management.ManagementObjectSearcher(
+                $"SELECT Path FROM Win32_Share WHERE Name = '{shareName.Replace("'", "''")}'");
+            foreach (var share in searcher.Get())
+            {
+                var localSharePath = share["Path"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(localSharePath))
+                {
+                    var localFull = string.IsNullOrEmpty(remainder)
+                        ? localSharePath.TrimEnd('\\')
+                        : Path.Combine(localSharePath, remainder);
+                    return localFull;
+                }
+            }
+        }
+        catch
+        {
+            // WMI não disponível ou sem permissão – manter UNC
+        }
+
+        return null;
+    }
+
+    private async void BtnConectar_Click(object? sender, EventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(txtAppServer.Text))
+        {
+            MessageBox.Show("Informe o servidor de aplicação.", "Validação",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        btnConectar.Enabled = false;
+        cmbSistema.Items.Clear();
+        _bdocPaths.Clear();
+
+        try
+        {
+            Log("Conectando ao servidor de aplicação...", Color.Cyan);
+            lblStatus.Text = "Conectando...";
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+            // 1. Obter connection string do BSERVER via porta 5331
+            var bserverCs = await GetBserverConnectionStringAsync(txtAppServer.Text, cts.Token);
+            Log("Connection string BSERVER obtida com sucesso!", Color.Green);
+
+            // 2. Detectar tipo de banco do BSERVER
+            var (isOracle, cs) = ParseReceivedConnectionString(bserverCs);
+            var dbType = isOracle ? "Oracle" : "SQL Server";
+            Log($"Tipo de banco BSERVER: {dbType}");
+
+            // 3. Garantir parâmetros adicionais na connection string
+            var adjustedCs = AdjustConnectionString(cs, isOracle, (int)numParallelism.Value);
+
+            // 4. Consultar diretórios BDOC (PARDIR + SECDIR)
+            Log("Consultando diretórios BDOC...");
+            _bdocPaths = await QueryBdocPathsAsync(adjustedCs, isOracle, cts.Token);
+            foreach (var p in _bdocPaths)
+                Log($"  [BDOC] {p}", Color.Gray);
+
+            if (_bdocPaths.Count > 0)
+            {
+                // Preencher campo BDOC com o primeiro diretório local encontrado (ou o primeiro disponível)
+                var localPath = _bdocPaths.FirstOrDefault(p => !p.StartsWith("\\\\")) ?? _bdocPaths[0];
+                txtBdocPath.Text = localPath;
+                Log($"Diretório BDOC selecionado: {localPath}", Color.Green);
+            }
+
+            // 5. Consultar sistemas disponíveis
+            Log("Consultando sistemas disponíveis...");
+            var systems = await QueryAvailableSystemsAsync(adjustedCs, isOracle, cts.Token);
+
+            // 6. Popular ComboBox
+            foreach (var sys in systems.OrderBy(s => s))
+                cmbSistema.Items.Add(sys);
+
+            if (cmbSistema.Items.Count > 0)
+                cmbSistema.SelectedIndex = 0;
+
+            Log($"{systems.Count} sistema(s) encontrado(s).", Color.Green);
+            lblStatus.Text = $"{systems.Count} sistema(s) carregado(s)";
+        }
+        catch (Exception ex)
+        {
+            Log($"ERRO ao conectar: {ex.Message}", Color.Red);
+            lblStatus.Text = "Erro na conexão";
+            MessageBox.Show($"Erro ao conectar ao servidor de aplicação:\n{ex.Message}", "Erro",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            btnConectar.Enabled = true;
         }
     }
 
@@ -781,7 +988,7 @@ public partial class MainForm : Form
         }
         catch (OperationCanceledException)
         {
-            Log("Operacao cancelada pelo usuario.", Color.Yellow);
+            Log("Operação cancelada pelo usuário.", Color.Yellow);
         }
         catch (Exception ex)
         {
@@ -807,49 +1014,43 @@ public partial class MainForm : Form
     {
         if (string.IsNullOrWhiteSpace(txtBdocPath.Text) || !Directory.Exists(txtBdocPath.Text))
         {
-            MessageBox.Show("Diretorio BDOC invalido ou nao existe.", "Validacao",
+            MessageBox.Show("Diretório BDOC inválido ou não existe.", "Validação",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
-        if (string.IsNullOrWhiteSpace(txtSystemName.Text))
+        if (string.IsNullOrWhiteSpace(txtAppServer.Text))
         {
-            MessageBox.Show("Nome do sistema e obrigatorio.", "Validacao",
+            MessageBox.Show("Servidor de aplicação é obrigatório.", "Validação",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
-        var dbType = IsOracle ? "Oracle" : "SQL Server";
-
-        if (string.IsNullOrWhiteSpace(txtServer.Text) ||
-            string.IsNullOrWhiteSpace(txtDatabase.Text) ||
-            string.IsNullOrWhiteSpace(txtUsername.Text))
+        if (cmbSistema.SelectedIndex < 0 || string.IsNullOrWhiteSpace(cmbSistema.Text))
         {
-            MessageBox.Show($"Dados de conexao {dbType} incompletos.", "Validacao",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
-        }
-
-        if (IsOracle && string.IsNullOrWhiteSpace(txtPort.Text))
-        {
-            MessageBox.Show("Porta do Oracle e obrigatoria.", "Validacao",
+            MessageBox.Show("Selecione um sistema. Clique em 'Conectar' para carregar os sistemas disponíveis.", "Validação",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
         if (!string.IsNullOrWhiteSpace(txtBackupPath.Text) && !Directory.Exists(txtBackupPath.Text))
         {
-            MessageBox.Show("Diretorio de backup invalido ou nao existe.", "Validacao",
+            MessageBox.Show("Diretório de backup inválido ou não existe.", "Validação",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
-        // Se checkbox de remover após backup está marcado, o caminho de backup é obrigatório
+        // Se checkbox de remover está marcado sem backup, pede confirmação
         if (chkRemoveAfterBackup.Checked && string.IsNullOrWhiteSpace(txtBackupPath.Text))
         {
-            MessageBox.Show("Para remover orfaos apos backup, e necessario configurar um caminho de backup valido.", "Validacao",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return false;
+            var result = MessageBox.Show(
+                "A opção de remover arquivos órfãos está marcada, porém nenhum caminho de backup foi configurado.\n\n" +
+                "Os arquivos serão removidos permanentemente sem backup!\n\n" +
+                "Deseja continuar mesmo assim?",
+                "Atenção - Sem Backup",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (result == DialogResult.No)
+                return false;
         }
 
         return true;
@@ -860,34 +1061,22 @@ public partial class MainForm : Form
         btnStart.Enabled = !running;
         btnCancel.Enabled = running;
         btnBrowse.Enabled = !running;
+        btnConectar.Enabled = !running;
         btnBrowseBackup.Enabled = !running;
         txtBdocPath.Enabled = !running;
+        txtAppServer.Enabled = !running;
         txtBackupPath.Enabled = !running;
-        txtSystemName.Enabled = !running;
-        cmbDatabaseType.Enabled = !running;
-        txtServer.Enabled = !running;
-        txtDatabase.Enabled = !running;
-        txtPort.Enabled = !running;
-        txtUsername.Enabled = !running;
-        txtPassword.Enabled = !running;
+        cmbSistema.Enabled = !running;
         cmbSearchMethod.Enabled = !running;
         numParallelism.Enabled = !running;
 
-        // Ajustar cor do botao Iniciar conforme estado
+        // Ajustar cor do botão Iniciar conforme estado
         btnStart.BackColor = running
             ? Color.FromArgb(180, 180, 180)
             : Color.FromArgb(0, 120, 212);
 
-        if (!running)
-        {
-            progressBar.Value = 100;
-            lblProgress.Text = "100%";
-        }
-        else
-        {
-            progressBar.Value = 0;
-            lblProgress.Text = "0%";
-        }
+        progressBar.Value = 0;
+        lblProgress.Text = running ? "0%" : "";
     }
 
     private void Log(string message, Color? color = null)
@@ -918,18 +1107,23 @@ public partial class MainForm : Form
         lblStatus.Text = status;
     }
 
-    // ===== Metodos auxiliares de abstração de banco =====
+    // ===== Métodos auxiliares de abstração de banco =====
 
-    private string BuildConnectionString(int maxParallelism)
+    private string AdjustConnectionString(string connectionString, bool isOracle, int maxParallelism)
     {
-        if (IsOracle)
+        // Adicionar Max Pool Size se não estiver presente
+        if (!connectionString.Contains("Max Pool Size", StringComparison.OrdinalIgnoreCase))
         {
-            return $"Data Source=(DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST={txtServer.Text})(PORT={txtPort.Text})))(CONNECT_DATA=(SERVICE_NAME={txtDatabase.Text})));User Id={txtUsername.Text};Password={txtPassword.Text};Max Pool Size={maxParallelism + 5};";
+            connectionString = connectionString.TrimEnd(';') + $";Max Pool Size={maxParallelism + 5};";
         }
-        else
+
+        // Para SQL Server, garantir TrustServerCertificate
+        if (!isOracle && !connectionString.Contains("TrustServerCertificate", StringComparison.OrdinalIgnoreCase))
         {
-            return $"Server={txtServer.Text};Database={txtDatabase.Text};User Id={txtUsername.Text};Password={txtPassword.Text};TrustServerCertificate=True;Max Pool Size={maxParallelism + 5};";
+            connectionString = connectionString.TrimEnd(';') + ";TrustServerCertificate=True;";
         }
+
+        return connectionString;
     }
 
     private DbConnection CreateConnection(string connectionString)
@@ -939,8 +1133,21 @@ public partial class MainForm : Form
         return new SqlConnection(connectionString);
     }
 
+    /// <summary>
+    /// Valida se o nome da tabela contém apenas caracteres seguros para uso em SQL
+    /// </summary>
+    private static bool IsValidTableName(string tableName)
+    {
+        // Aceitar apenas letras, números, underscore e cifrão (padrão BDOC: DO_ADMISSAODOCUMENTOS)
+        return !string.IsNullOrWhiteSpace(tableName) &&
+               tableName.All(c => char.IsLetterOrDigit(c) || c == '_' || c == '$');
+    }
+
     private string BuildHandleQuery(string tableName, string? inClause = null)
     {
+        if (!IsValidTableName(tableName))
+            throw new ArgumentException($"Nome de tabela inválido: {tableName}");
+
         if (IsOracle)
         {
             var q = $"SELECT DISTINCT HANDLE FROM \"{tableName.ToUpperInvariant()}\"";
@@ -955,57 +1162,110 @@ public partial class MainForm : Form
 
     private int GetBatchSize()
     {
-        // Oracle tem limite de 1000 expressoes na clausula IN
-        // SQL Server suporta ate ~2000
-        return IsOracle ? 1000 : 2000;
+        return IsOracle ? ORACLE_BATCH_SIZE : SQLSERVER_BATCH_SIZE;
     }
 
     private async Task ProcessOrphanFilesAsync(CancellationToken ct)
     {
-        var bdocPath = txtBdocPath.Text;
-        var systemName = txtSystemName.Text;
+        var systemName = cmbSistema.Text;
         var maxParallelism = (int)numParallelism.Value;
         var searchMethod = cmbSearchMethod.SelectedIndex;
-        var dbType = IsOracle ? "Oracle" : "SQL Server";
+
+        // Determinar diretórios BDOC a usar
+        var bdocDirs = new List<string>();
+        if (!string.IsNullOrWhiteSpace(txtBdocPath.Text))
+        {
+            bdocDirs.Add(txtBdocPath.Text.TrimEnd('\\'));
+        }
+        // Adicionar diretórios do BSERVER que não estejam já na lista
+        foreach (var p in _bdocPaths)
+        {
+            if (!bdocDirs.Any(d => d.Equals(p, StringComparison.OrdinalIgnoreCase)))
+                bdocDirs.Add(p);
+        }
 
         Log("Iniciando processamento...", Color.Cyan);
-        Log($"Diretorio BDOC: {bdocPath}");
+        Log($"Diretórios BDOC: {string.Join("; ", bdocDirs)}");
         Log($"Sistema: {systemName}");
-        Log($"Banco de dados: {dbType}");
-        Log($"Metodo: {cmbSearchMethod.SelectedItem}");
+        Log($"Servidor de aplicação: {txtAppServer.Text}");
+        Log($"Método: {cmbSearchMethod.SelectedItem}");
         Log($"Threads: {maxParallelism}");
         Log("");
 
         var startTime = DateTime.Now;
 
-        // Find system paths
+        // Find system paths - procurar em dois níveis:
+        // 1. Direto na raiz do BDOC: BDOC\SISTEMA\
+        // 2. Um nível abaixo: BDOC\subdir\SISTEMA\
         Log("Procurando caminhos do sistema...");
         var systemPaths = new List<string>();
-        foreach (var subdir in Directory.EnumerateDirectories(bdocPath))
+
+        foreach (var bdocPath in bdocDirs)
         {
-            var systemPath = Path.Combine(subdir, systemName);
-            if (Directory.Exists(systemPath))
+            if (!Directory.Exists(bdocPath))
             {
-                systemPaths.Add(systemPath);
-                Log($"  [ENCONTRADO] {systemPath}", Color.Green);
+                Log($"  [AVISO] Diretório não acessível: {bdocPath}", Color.Yellow);
+                continue;
             }
+
+            // Nível 1: BDOC\SISTEMA\ (direto na raiz)
+            var directPath = Path.Combine(bdocPath, systemName);
+            if (Directory.Exists(directPath))
+            {
+                systemPaths.Add(directPath);
+                Log($"  [ENCONTRADO] {directPath}", Color.Green);
+            }
+
+            // Nível 2: BDOC\subdir\SISTEMA\ (um nível abaixo)
+            try
+            {
+                foreach (var subdir in Directory.EnumerateDirectories(bdocPath))
+                {
+                    var subdirName = Path.GetFileName(subdir);
+                    // Evitar duplicata se o subdir for o próprio sistema (já encontrado acima)
+                    if (subdirName.Equals(systemName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var systemPath = Path.Combine(subdir, systemName);
+                    if (Directory.Exists(systemPath))
+                    {
+                        systemPaths.Add(systemPath);
+                        Log($"  [ENCONTRADO] {systemPath}", Color.Green);
+                    }
+                }
+            }
+            catch (UnauthorizedAccessException) { }
+            catch (DirectoryNotFoundException) { }
         }
 
         if (systemPaths.Count == 0)
         {
-            Log($"ERRO: Sistema '{systemName}' nao encontrado.", Color.Red);
+            Log($"ERRO: Sistema '{systemName}' não encontrado em nenhum diretório BDOC.", Color.Red);
             return;
         }
 
-        // Connection string
-        var connectionString = BuildConnectionString(maxParallelism);
+        // Usar o primeiro BDOC como referência para caminhos relativos (backup)
+        var bdocPath_ref = bdocDirs[0];
+
+        // Obter connection string do sistema via telnet porta 5337
+        Log("Obtendo connection string do sistema via servidor de aplicação...", Color.Cyan);
+        var rawCs = await GetSystemConnectionStringAsync(txtAppServer.Text, systemName, ct);
+
+        // Detectar tipo de banco
+        var (isOracle, cs) = ParseReceivedConnectionString(rawCs);
+        _isOracle = isOracle;
+        var dbType = IsOracle ? "Oracle" : "SQL Server";
+        Log($"Tipo de banco detectado: {dbType}", Color.Green);
+
+        // Ajustar connection string
+        var connectionString = AdjustConnectionString(cs, isOracle, maxParallelism);
 
         // Test connection
-        Log($"Testando conexao com banco de dados {dbType}...");
+        Log($"Testando conexão com banco de dados {dbType}...");
         using (var testConn = CreateConnection(connectionString))
         {
             await testConn.OpenAsync(ct);
-            Log("Conexao estabelecida com sucesso!", Color.Green);
+            Log("Conexão estabelecida com sucesso!", Color.Green);
         }
 
         // Use strategy based on selection
@@ -1013,6 +1273,24 @@ public partial class MainForm : Form
         // 1 = .NET EnumerateFiles
         if (searchMethod == 0) // MFT
         {
+            // MFT não suporta caminhos de rede (UNC)
+            if (bdocPath_ref.StartsWith("\\\\"))
+            {
+                Log("ERRO: O método MFT não suporta caminhos de rede (UNC).", Color.Red);
+                Log("Use o método '.NET EnumerateFiles' para caminhos de rede.", Color.Yellow);
+                return;
+            }
+
+            // Verificar se está rodando como Administrador
+            var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            if (!principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator))
+            {
+                Log("ERRO: O método MFT requer execução como Administrador.", Color.Red);
+                Log("Execute o programa como Administrador ou use o método '.NET EnumerateFiles'.", Color.Yellow);
+                return;
+            }
+
             await ProcessWithMftStrategyAsync(systemPaths, systemName, connectionString, maxParallelism, ct);
         }
         else // .NET EnumerateFiles (Híbrido Paralelo)
@@ -1028,33 +1306,38 @@ public partial class MainForm : Form
         var filesRemoved = 0;
         var removeErrors = 0;
 
+        var backupCancelled = false;
+
         if (!string.IsNullOrWhiteSpace(backupPath) && !_orphanFiles.IsEmpty)
         {
             // Se checkbox de remoção está marcado, pedir confirmação
             if (chkRemoveAfterBackup.Checked)
             {
                 var confirmResult = MessageBox.Show(
-                    $"Foram encontrados {_orphanFiles.Count} arquivos orfaos ({FormatSize(_totalOrphanSize)}).\n\n" +
-                    $"Os arquivos serao copiados para:\n{backupPath}\n\n" +
-                    "ATENCAO: Apos o backup, os arquivos originais serao REMOVIDOS do BDOC!\n\n" +
-                    "Deseja continuar com o backup e remocao?",
-                    "Confirmacao de Remocao",
+                    $"Foram encontrados {_orphanFiles.Count} arquivos órfãos ({FormatSize(_totalOrphanSize)}).\n\n" +
+                    $"Os arquivos serão copiados para:\n{backupPath}\n\n" +
+                    "ATENÇÃO: Após o backup, os arquivos originais serão REMOVIDOS do BDOC!\n\n" +
+                    "Deseja continuar com o backup e remoção?",
+                    "Confirmação de Remoção",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning,
                     MessageBoxDefaultButton.Button2);
 
                 if (confirmResult != DialogResult.Yes)
                 {
-                    Log("Operacao de backup/remocao cancelada pelo usuario.", Color.Yellow);
-                    // Pular para o relatório final
-                    goto FinalReport;
+                    Log("Operação de backup/remoção cancelada pelo usuário.", Color.Yellow);
+                    backupCancelled = true;
                 }
-
-                shouldRemoveOrphans = true;
+                else
+                {
+                    shouldRemoveOrphans = true;
+                }
             }
 
+            if (!backupCancelled)
+            {
             Log("");
-            Log("=== FASE 3: Backup dos arquivos orfaos ===", Color.Cyan);
+            Log("=== FASE 3: Backup dos arquivos órfãos ===", Color.Cyan);
             var phase3Start = DateTime.Now;
 
             var orphanList = _orphanFiles.ToList();
@@ -1073,18 +1356,22 @@ public partial class MainForm : Form
                 {
                     try
                     {
-                        var relativePath = Path.GetRelativePath(bdocPath, orphan.FilePath);
+                        // Encontrar o BDOC base correto para este arquivo
+                        var baseBdoc = bdocDirs.FirstOrDefault(d => orphan.FilePath.StartsWith(d + "\\", StringComparison.OrdinalIgnoreCase)) ?? bdocPath_ref;
+                        var relativePath = Path.GetRelativePath(baseBdoc, orphan.FilePath);
                         var destPath = Path.Combine(backupPath, relativePath);
                         var destDir = Path.GetDirectoryName(destPath)!;
 
                         Directory.CreateDirectory(destDir);
-                        File.Copy(orphan.FilePath, destPath, overwrite: false);
+
+                        // Se arquivo já existe no destino (re-execução), sobrescrever
+                        File.Copy(orphan.FilePath, destPath, overwrite: true);
 
                         // Marcar como copiado com sucesso
                         successfullyCopied.Add(orphan.FilePath);
 
                         var done = Interlocked.Increment(ref copied);
-                        if (done % 100 == 0 || done == totalOrphans)
+                        if (done % PROGRESS_UPDATE_INTERVAL == 0 || done == totalOrphans)
                         {
                             UpdateProgress(done, totalOrphans, $"Fase 3: Backup ({done}/{totalOrphans} arquivos)");
                         }
@@ -1102,8 +1389,8 @@ public partial class MainForm : Form
             _totalFilesCopied = copied;
             _totalCopyErrors = errors;
 
-            Log($"Backup concluido: {copied} copiados, {errors} erros", copied > 0 ? Color.Green : Color.Yellow);
-            Log($"Fase 3 concluida em: {_phase3Duration:mm\\:ss\\.fff}", Color.Green);
+            Log($"Backup concluído: {copied} copiados, {errors} erros", copied > 0 ? Color.Green : Color.Yellow);
+            Log($"Fase 3 concluída em: {_phase3Duration:mm\\:ss\\.fff}", Color.Green);
 
             // ================================================================
             // FASE 4: Remoção dos arquivos órfãos do BDOC (se solicitado)
@@ -1111,65 +1398,25 @@ public partial class MainForm : Form
             if (shouldRemoveOrphans && !successfullyCopied.IsEmpty)
             {
                 Log("");
-                Log("=== FASE 4: Remocao dos arquivos orfaos do BDOC ===", Color.Cyan);
+                Log("=== FASE 4: Remoção dos arquivos órfãos do BDOC ===", Color.Cyan);
                 var phase4Start = DateTime.Now;
 
                 var filesToRemove = successfullyCopied.ToList();
                 var totalToRemove = filesToRemove.Count;
                 var dirsRemoved = 0;
 
-                // Normalizar systemPaths para comparação (limite de deleção de pastas)
-                var normalizedSystemPaths = systemPaths.Select(p => p.TrimEnd('\\').ToUpperInvariant()).ToHashSet();
-
                 Log($"Removendo {totalToRemove} arquivos do BDOC...");
 
+                // Passo 1: Deletar arquivos em paralelo (sem tocar em pastas)
                 await Parallel.ForEachAsync(filesToRemove,
                     new ParallelOptions { MaxDegreeOfParallelism = (int)numParallelism.Value, CancellationToken = ct },
                     async (filePath, token) =>
                     {
                         try
                         {
-                            // Deletar o arquivo
                             File.Delete(filePath);
                             var done = Interlocked.Increment(ref filesRemoved);
-
-                            // Tentar remover pastas vazias subindo até o diretório da tabela
-                            var currentDir = Path.GetDirectoryName(filePath);
-                            while (!string.IsNullOrEmpty(currentDir))
-                            {
-                                var normalizedCurrentDir = currentDir.TrimEnd('\\').ToUpperInvariant();
-
-                                // Parar se chegou no diretório do sistema (ex: B:\BDOC\2025-12\RH_PROD)
-                                // Não deletar a pasta da tabela nem acima
-                                var isSystemPath = normalizedSystemPaths.Any(sp =>
-                                    normalizedCurrentDir.Equals(sp) ||
-                                    normalizedCurrentDir.StartsWith(sp + "\\") &&
-                                    normalizedCurrentDir.Substring(sp.Length + 1).IndexOf('\\') == -1);
-
-                                if (isSystemPath || normalizedSystemPaths.Any(sp => sp.StartsWith(normalizedCurrentDir)))
-                                    break;
-
-                                try
-                                {
-                                    // Só deleta se estiver vazio
-                                    if (Directory.Exists(currentDir) && !Directory.EnumerateFileSystemEntries(currentDir).Any())
-                                    {
-                                        Directory.Delete(currentDir);
-                                        Interlocked.Increment(ref dirsRemoved);
-                                        currentDir = Path.GetDirectoryName(currentDir);
-                                    }
-                                    else
-                                    {
-                                        break; // Pasta não está vazia, parar
-                                    }
-                                }
-                                catch
-                                {
-                                    break; // Erro ao deletar pasta, parar
-                                }
-                            }
-
-                            if (done % 100 == 0 || done == totalToRemove)
+                            if (done % PROGRESS_UPDATE_INTERVAL == 0 || done == totalToRemove)
                             {
                                 UpdateProgress(done, totalToRemove, $"Fase 4: Removendo ({done}/{totalToRemove} arquivos)");
                             }
@@ -1177,19 +1424,100 @@ public partial class MainForm : Form
                         catch (Exception ex)
                         {
                             Interlocked.Increment(ref removeErrors);
-                            Log($"  [ERRO REMOCAO] {Path.GetFileName(filePath)}: {ex.Message}", Color.Yellow);
+                            Log($"  [ERRO REMOÇÃO] {Path.GetFileName(filePath)}: {ex.Message}", Color.Yellow);
                         }
 
                         await Task.CompletedTask;
                     });
 
-                var phase4Duration = DateTime.Now - phase4Start;
-                Log($"Remocao concluida: {filesRemoved} arquivos, {dirsRemoved} pastas vazias, {removeErrors} erros", filesRemoved > 0 ? Color.Green : Color.Yellow);
-                Log($"Fase 4 concluida em: {phase4Duration:mm\\:ss\\.fff}", Color.Green);
-            }
-        }
+                // Passo 2: Limpar pastas vazias sequencialmente (evita race condition)
+                var normalizedSystemPaths = systemPaths.Select(p => p.TrimEnd('\\').ToUpperInvariant()).ToHashSet();
 
-        FinalReport:
+                // Coletar pastas candidatas e ordenar do mais profundo para o mais raso
+                var candidateDirs = filesToRemove
+                    .Select(f => Path.GetDirectoryName(f))
+                    .Where(d => !string.IsNullOrEmpty(d))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderByDescending(d => d!.Length)
+                    .ToList();
+
+                foreach (var dir in candidateDirs)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var currentDir = dir;
+
+                    while (!string.IsNullOrEmpty(currentDir))
+                    {
+                        var normalizedCurrentDir = currentDir.TrimEnd('\\').ToUpperInvariant();
+
+                        // Parar se chegou no diretório da tabela ou acima
+                        var isTableOrAbove = normalizedSystemPaths.Any(sp =>
+                            normalizedCurrentDir.Equals(sp) ||
+                            sp.StartsWith(normalizedCurrentDir + "\\") ||
+                            normalizedCurrentDir.Equals(sp) ||
+                            (normalizedCurrentDir.StartsWith(sp + "\\") &&
+                             normalizedCurrentDir.Substring(sp.Length + 1).IndexOf('\\') == -1));
+
+                        if (isTableOrAbove)
+                            break;
+
+                        try
+                        {
+                            if (Directory.Exists(currentDir) && !Directory.EnumerateFileSystemEntries(currentDir).Any())
+                            {
+                                Directory.Delete(currentDir);
+                                dirsRemoved++;
+                                currentDir = Path.GetDirectoryName(currentDir);
+                            }
+                            else
+                            {
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                var phase4Duration = DateTime.Now - phase4Start;
+                Log($"Remoção concluída: {filesRemoved} arquivos, {dirsRemoved} pastas vazias, {removeErrors} erros", filesRemoved > 0 ? Color.Green : Color.Yellow);
+                Log($"Fase 4 concluída em: {phase4Duration:mm\\:ss\\.fff}", Color.Green);
+
+                // Gerar log de auditoria da remoção
+                try
+                {
+                    var auditFileName = $"auditoria_remocao_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
+                    var auditPath = Path.Combine(Environment.CurrentDirectory, auditFileName);
+                    var auditSb = new StringBuilder();
+                    auditSb.AppendLine("============================================");
+                    auditSb.AppendLine("       AUDITORIA DE REMOÇÃO DE ÓRFÃOS");
+                    auditSb.AppendLine("============================================");
+                    auditSb.AppendLine($"Data/Hora: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                    auditSb.AppendLine($"Usuário: {Environment.UserName}");
+                    auditSb.AppendLine($"Máquina: {Environment.MachineName}");
+                    auditSb.AppendLine($"BDOC: {string.Join("; ", bdocDirs)}");
+                    auditSb.AppendLine($"Backup: {backupPath}");
+                    auditSb.AppendLine($"Arquivos removidos: {filesRemoved}");
+                    auditSb.AppendLine($"Pastas removidas: {dirsRemoved}");
+                    auditSb.AppendLine($"Erros: {removeErrors}");
+                    auditSb.AppendLine();
+                    auditSb.AppendLine("ARQUIVOS REMOVIDOS:");
+                    foreach (var f in filesToRemove)
+                    {
+                        auditSb.AppendLine(f);
+                    }
+                    File.WriteAllText(auditPath, auditSb.ToString(), Encoding.UTF8);
+                    Log($"Log de auditoria: {auditPath}", Color.Green);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Erro ao gerar log de auditoria: {ex.Message}", Color.Yellow);
+                }
+            }
+            } // fim if (!backupCancelled)
+        }
 
         // Final report
         var elapsed = DateTime.Now - startTime;
@@ -1197,28 +1525,28 @@ public partial class MainForm : Form
 
         Log("", Color.White);
         Log("============================================", Color.Cyan);
-        Log("           RELATORIO FINAL", Color.Cyan);
+        Log("           RELATÓRIO FINAL", Color.Cyan);
         Log("============================================", Color.Cyan);
         Log($"Banco de dados: {dbType}");
         Log($"Total de arquivos analisados: {_totalFilesAnalyzed}");
         Log($"Arquivos COM registro na base: {_filesWithRecord}", Color.Green);
-        Log($"Arquivos ORFAOS (sem registro): {orphanCount}", orphanCount > 0 ? Color.Red : Color.Green);
-        Log($"Espaco ocupado por orfaos: {FormatSize(_totalOrphanSize)}", Color.Yellow);
+        Log($"Arquivos ÓRFÃOS (sem registro): {orphanCount}", orphanCount > 0 ? Color.Red : Color.Green);
+        Log($"Espaço ocupado por órfãos: {FormatSize(_totalOrphanSize)}", Color.Yellow);
         if (_totalFilesCopied > 0 || _totalCopyErrors > 0)
         {
             Log($"Backup: {_totalFilesCopied} copiados, {_totalCopyErrors} erros", Color.Cyan);
         }
         if (filesRemoved > 0 || removeErrors > 0)
         {
-            Log($"Remocao: {filesRemoved} removidos, {removeErrors} erros", Color.Cyan);
+            Log($"Remoção: {filesRemoved} removidos, {removeErrors} erros", Color.Cyan);
         }
         Log("");
-        Log("--- METRICAS DE PERFORMANCE ---", Color.Cyan);
-        Log($"Fase 1 (Enumeracao de arquivos): {_phase1Duration:hh\\:mm\\:ss\\.fff}");
-        Log($"Fase 2 (Validacao no banco): {_phase2Duration:hh\\:mm\\:ss\\.fff}");
+        Log("--- MÉTRICAS DE PERFORMANCE ---", Color.Cyan);
+        Log($"Fase 1 (Enumeração de arquivos): {_phase1Duration:hh\\:mm\\:ss\\.fff}");
+        Log($"Fase 2 (Validação no banco): {_phase2Duration:hh\\:mm\\:ss\\.fff}");
         if (_phase3Duration > TimeSpan.Zero)
         {
-            Log($"Fase 3 (Backup de orfaos): {_phase3Duration:hh\\:mm\\:ss\\.fff}");
+            Log($"Fase 3 (Backup de órfãos): {_phase3Duration:hh\\:mm\\:ss\\.fff}");
         }
         Log($"Tabelas processadas: {_totalTablesProcessed}");
         Log($"Tempo total: {elapsed:hh\\:mm\\:ss\\.fff}");
@@ -1249,7 +1577,7 @@ public partial class MainForm : Form
         // ================================================================
         Log("");
         Log("=== FASE 1: Leitura direta da MFT (Master File Table) ===", Color.Cyan);
-        Log("NOTA: Este metodo requer execucao como Administrador", Color.Yellow);
+        Log("NOTA: Este método requer execução como Administrador", Color.Yellow);
         var phase1Start = DateTime.Now;
 
         // Descobrir drive letter do BDOC path
@@ -1263,7 +1591,7 @@ public partial class MainForm : Form
         {
             // Limite de memória: 1.5GB para o scanner MFT
             const long memoryLimit = 1536L * 1024 * 1024;
-            Log($"Limite de memoria configurado: {memoryLimit / (1024 * 1024)} MB", Color.Gray);
+            Log($"Limite de memória configurado: {memoryLimit / (1024 * 1024)} MB", Color.Gray);
             Log($"Filtrando apenas arquivos dentro de: {bdocPath}", Color.Gray);
 
             allBdfFiles = await Task.Run(() =>
@@ -1287,13 +1615,12 @@ public partial class MainForm : Form
         catch (InvalidOperationException ex)
         {
             Log($"ERRO: {ex.Message}", Color.Red);
-            Log("Alternativa: Use o metodo 'Win32 API' que nao requer Admin.", Color.Yellow);
+            Log("Alternativa: Use o método '.NET EnumerateFiles'.", Color.Yellow);
             return;
         }
         catch (OutOfMemoryException)
         {
-            Log("ERRO: Memoria insuficiente. Tente o metodo 'Win32 API'.", Color.Red);
-            GC.Collect(2, GCCollectionMode.Forced);
+            Log("ERRO: Memória insuficiente. Tente o método '.NET EnumerateFiles'.", Color.Red);
             return;
         }
 
@@ -1342,13 +1669,13 @@ public partial class MainForm : Form
         _totalFilesAnalyzed = relevantFiles.Count;
 
         Log($"Tabelas encontradas: {filesByTable.Count}", Color.Green);
-        Log($"Fase 1 concluida em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
+        Log($"Fase 1 concluída em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
 
         // ================================================================
         // FASE 2: Validação paralela no banco de dados
         // ================================================================
         Log("");
-        Log("=== FASE 2: Validacao paralela no banco de dados ===", Color.Cyan);
+        Log("=== FASE 2: Validação paralela no banco de dados ===", Color.Cyan);
         var phase2Start = DateTime.Now;
 
         var tablesToProcess = filesByTable.Where(kvp => !kvp.Value.IsEmpty).ToList();
@@ -1400,7 +1727,7 @@ public partial class MainForm : Form
 
                     if (orphansInTable > 0)
                     {
-                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
+                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} órfãos", Color.Red);
                     }
                 }
                 catch (DbException ex)
@@ -1414,154 +1741,7 @@ public partial class MainForm : Form
             });
 
         _phase2Duration = DateTime.Now - phase2Start;
-        Log($"Fase 2 concluida em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
-    }
-
-    /// <summary>
-    /// ESTRATÉGIA WIN32 API - MÁXIMA PERFORMANCE
-    /// Usa FindFirstFile/FindNextFile para enumeração mais rápida
-    /// </summary>
-    private async Task ProcessWithWin32StrategyAsync(
-        List<string> systemPaths,
-        string systemName,
-        string connectionString,
-        int maxParallelism,
-        CancellationToken ct)
-    {
-        // ================================================================
-        // FASE 1: Enumeração com Win32 API por diretório de tabela
-        // ================================================================
-        Log("");
-        Log("=== FASE 1: Enumeracao com Win32 API (Alta Performance) ===", Color.Cyan);
-        var phase1Start = DateTime.Now;
-
-        // Descobrir todos os diretórios de tabelas
-        var tableDirs = new ConcurrentDictionary<string, ConcurrentBag<string>>();
-        foreach (var systemPath in systemPaths)
-        {
-            foreach (var tableDir in Directory.EnumerateDirectories(systemPath))
-            {
-                var tableName = Path.GetFileName(tableDir);
-                tableDirs.GetOrAdd(tableName, _ => new ConcurrentBag<string>()).Add(tableDir);
-            }
-        }
-
-        Log($"Tabelas encontradas: {tableDirs.Count}");
-
-        // Estrutura thread-safe para armazenar arquivos por tabela
-        var filesByTable = new ConcurrentDictionary<string, ConcurrentBag<FileHandleInfo>>();
-        var totalFilesFound = 0;
-        var directoriesProcessed = 0;
-        var totalDirectories = tableDirs.Values.Sum(b => b.Count);
-
-        // Processar diretórios em paralelo usando Win32 API
-        var allDirs = tableDirs.SelectMany(kvp => kvp.Value.Select(dir => (Table: kvp.Key, Dir: dir))).ToList();
-
-        await Parallel.ForEachAsync(allDirs,
-            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = ct },
-            async (item, token) =>
-            {
-                var (tableName, tableDir) = item;
-                token.ThrowIfCancellationRequested();
-
-                var bag = filesByTable.GetOrAdd(tableName, _ => new ConcurrentBag<FileHandleInfo>());
-                var localFileCount = 0;
-
-                try
-                {
-                    // Usar Win32 API para enumerar arquivos
-                    EnumerateFilesWithWin32Api(tableDir, "*.BDF", bag, ref localFileCount);
-                }
-                catch (Exception) { }
-
-                Interlocked.Add(ref totalFilesFound, localFileCount);
-                var processed = Interlocked.Increment(ref directoriesProcessed);
-
-                if (processed % 10 == 0 || processed == totalDirectories)
-                {
-                    UpdateProgress(processed, totalDirectories, $"Fase 1: Win32 API ({processed}/{totalDirectories} dirs, {totalFilesFound} arquivos)");
-                }
-
-                await Task.CompletedTask;
-            });
-
-        _phase1Duration = DateTime.Now - phase1Start;
-        _totalFilesAnalyzed = totalFilesFound;
-
-        Log($"Arquivos encontrados: {totalFilesFound} em {tableDirs.Count} tabelas", Color.Green);
-        Log($"Fase 1 concluida em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
-
-        // ================================================================
-        // FASE 2: Validação paralela no banco de dados (igual ao híbrido)
-        // ================================================================
-        Log("");
-        Log("=== FASE 2: Validacao paralela no banco de dados ===", Color.Cyan);
-        var phase2Start = DateTime.Now;
-
-        var tablesToProcess = filesByTable.Where(kvp => !kvp.Value.IsEmpty).ToList();
-        var tablesProcessed = 0;
-        var totalTables = tablesToProcess.Count;
-
-        Log($"Tabelas com arquivos para validar: {totalTables}");
-
-        await Parallel.ForEachAsync(tablesToProcess,
-            new ParallelOptions { MaxDegreeOfParallelism = maxParallelism, CancellationToken = ct },
-            async (kvp, token) =>
-            {
-                var tableName = kvp.Key;
-                var files = kvp.Value.ToList();
-                var handleList = files.Select(f => f.Handle).Distinct().ToList();
-
-                try
-                {
-                    var existingHandles = await QueryExistingHandlesAsync(
-                        connectionString, tableName, handleList, token);
-
-                    var orphansInTable = 0;
-                    foreach (var file in files)
-                    {
-                        if (!existingHandles.Contains(file.Handle))
-                        {
-                            long size = 0;
-                            try { size = new FileInfo(file.FilePath).Length; } catch { }
-
-                            var orphan = new OrphanFile
-                            {
-                                Sistema = systemName,
-                                Tabela = tableName,
-                                Handle = file.Handle,
-                                FileName = file.FileName,
-                                FilePath = file.FilePath,
-                                Size = size
-                            };
-
-                            _orphanFiles.Add(orphan);
-                            Interlocked.Add(ref _totalOrphanSize, size);
-                            orphansInTable++;
-                        }
-                        else
-                        {
-                            Interlocked.Increment(ref _filesWithRecord);
-                        }
-                    }
-
-                    if (orphansInTable > 0)
-                    {
-                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
-                    }
-                }
-                catch (DbException ex)
-                {
-                    Log($"  [AVISO] Erro na tabela {tableName}: {ex.Message}", Color.Yellow);
-                }
-
-                var processed = Interlocked.Increment(ref tablesProcessed);
-                Interlocked.Increment(ref _totalTablesProcessed);
-                UpdateProgress(processed, totalTables, $"Fase 2: Validando ({processed}/{totalTables} tabelas)");
-            });
-
-        _phase2Duration = DateTime.Now - phase2Start;
-        Log($"Fase 2 concluida em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
+        Log($"Fase 2 concluída em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
     }
 
     /// <summary>
@@ -1580,7 +1760,7 @@ public partial class MainForm : Form
         // FASE 1: Enumeração paralela de arquivos por diretório de tabela
         // ================================================================
         Log("");
-        Log("=== FASE 1: Enumeracao paralela de arquivos ===", Color.Cyan);
+        Log("=== FASE 1: Enumeração paralela de arquivos ===", Color.Cyan);
         var phase1Start = DateTime.Now;
 
         // Descobrir todos os diretórios de tabelas
@@ -1645,13 +1825,13 @@ public partial class MainForm : Form
         _totalFilesAnalyzed = totalFilesFound;
 
         Log($"Arquivos encontrados: {totalFilesFound} em {tableDirs.Count} tabelas", Color.Green);
-        Log($"Fase 1 concluida em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
+        Log($"Fase 1 concluída em: {_phase1Duration:mm\\:ss\\.fff}", Color.Green);
 
         // ================================================================
         // FASE 2: Validação paralela no banco de dados
         // ================================================================
         Log("");
-        Log("=== FASE 2: Validacao paralela no banco de dados ===", Color.Cyan);
+        Log("=== FASE 2: Validação paralela no banco de dados ===", Color.Cyan);
         var phase2Start = DateTime.Now;
 
         var tablesToProcess = filesByTable.Where(kvp => !kvp.Value.IsEmpty).ToList();
@@ -1706,7 +1886,7 @@ public partial class MainForm : Form
 
                     if (orphansInTable > 0)
                     {
-                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} orfaos", Color.Red);
+                        Log($"  [{tableName}] {files.Count} arquivos, {orphansInTable} órfãos", Color.Red);
                     }
                 }
                 catch (DbException ex)
@@ -1720,7 +1900,7 @@ public partial class MainForm : Form
             });
 
         _phase2Duration = DateTime.Now - phase2Start;
-        Log($"Fase 2 concluida em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
+        Log($"Fase 2 concluída em: {_phase2Duration:mm\\:ss\\.fff}", Color.Green);
     }
 
     /// <summary>
@@ -1765,7 +1945,7 @@ public partial class MainForm : Form
 
             using var cmd = connection.CreateCommand();
             cmd.CommandText = query;
-            cmd.CommandTimeout = 120;
+            cmd.CommandTimeout = DB_COMMAND_TIMEOUT;
 
             using var reader = await cmd.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
@@ -1778,314 +1958,6 @@ public partial class MainForm : Form
         return existingHandles;
     }
 
-    /// <summary>
-    /// Estratégia legada (sequencial) para compatibilidade
-    /// </summary>
-    private async Task ProcessWithLegacyStrategyAsync(
-        List<string> systemPaths,
-        string systemName,
-        string connectionString,
-        int searchMethod,
-        CancellationToken ct)
-    {
-        Log("");
-        Log("=== Processamento Sequencial (Legado) ===", Color.Yellow);
-        var phase1Start = DateTime.Now;
-
-        using var connection = CreateConnection(connectionString);
-        await connection.OpenAsync(ct);
-
-        // Discover tables
-        var tables = new HashSet<string>();
-        var tablePaths = new Dictionary<string, List<string>>();
-
-        foreach (var systemPath in systemPaths)
-        {
-            ct.ThrowIfCancellationRequested();
-            foreach (var tableDir in Directory.EnumerateDirectories(systemPath))
-            {
-                var tableName = Path.GetFileName(tableDir);
-                tables.Add(tableName);
-
-                if (!tablePaths.ContainsKey(tableName))
-                    tablePaths[tableName] = new List<string>();
-                tablePaths[tableName].Add(tableDir);
-            }
-        }
-
-        Log($"Total de tabelas encontradas: {tables.Count}", Color.Cyan);
-        _phase1Duration = DateTime.Now - phase1Start;
-
-        var phase2Start = DateTime.Now;
-        int tableIndex = 0;
-        int totalTables = tables.Count;
-
-        foreach (var table in tables)
-        {
-            ct.ThrowIfCancellationRequested();
-            tableIndex++;
-
-            UpdateProgress(tableIndex, totalTables, $"Processando tabela {table} ({tableIndex}/{totalTables})");
-            Log($"[{tableIndex}/{totalTables}] Processando tabela: {table}", Color.Yellow);
-
-            var handles = new HashSet<int>();
-            try
-            {
-                var query = BuildHandleQuery(table);
-                using var cmd = connection.CreateCommand();
-                cmd.CommandText = query;
-                cmd.CommandTimeout = 300;
-
-                using var reader = await cmd.ExecuteReaderAsync(ct);
-                while (await reader.ReadAsync(ct))
-                {
-                    if (!reader.IsDBNull(0))
-                        handles.Add(reader.GetInt32(0));
-                }
-            }
-            catch (DbException ex)
-            {
-                Log($"  [AVISO] Erro ao consultar tabela {table}: {ex.Message}", Color.Yellow);
-                continue;
-            }
-
-            if (handles.Count == 0) continue;
-
-            foreach (var tablePath in tablePaths[table])
-            {
-                ct.ThrowIfCancellationRequested();
-                if (!Directory.Exists(tablePath)) continue;
-
-                // searchMethod: 3 = .NET EnumerateFiles, 4 = Robocopy
-                var files = searchMethod == 3 ? GetFilesWithDotNet(tablePath) : GetFilesWithRobocopy(tablePath);
-
-                foreach (var filePath in files)
-                {
-                    ct.ThrowIfCancellationRequested();
-                    _totalFilesAnalyzed++;
-
-                    if (!TryExtractHandle(filePath, out var handle, out var fileName)) continue;
-
-                    if (!handles.Contains(handle))
-                    {
-                        long size = 0;
-                        try { size = new FileInfo(filePath).Length; } catch { }
-
-                        var orphan = new OrphanFile
-                        {
-                            Sistema = systemName,
-                            Tabela = table,
-                            Handle = handle,
-                            FileName = fileName,
-                            FilePath = filePath,
-                            Size = size
-                        };
-
-                        _orphanFiles.Add(orphan);
-                        Interlocked.Add(ref _totalOrphanSize, size);
-                    }
-                    else
-                    {
-                        _filesWithRecord++;
-                    }
-                }
-            }
-            _totalTablesProcessed++;
-        }
-
-        _phase2Duration = DateTime.Now - phase2Start;
-    }
-
-    private IEnumerable<string> GetBdfFiles(string path)
-    {
-        // Método auxiliar - usa .NET EnumerateFiles como padrão
-        return GetFilesWithDotNet(path);
-    }
-
-    private IEnumerable<string> GetFilesWithDotNet(string path)
-    {
-        try
-        {
-            return Directory.EnumerateFiles(path, "*.BDF", SearchOption.AllDirectories);
-        }
-        catch
-        {
-            return Enumerable.Empty<string>();
-        }
-    }
-
-    private IEnumerable<string> GetFilesWithRobocopy(string path)
-    {
-        var files = new List<string>();
-        try
-        {
-            var tempDir = Path.Combine(Path.GetTempPath(), $"robocopy_{Guid.NewGuid()}");
-            Directory.CreateDirectory(tempDir);
-
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "robocopy.exe",
-                Arguments = $"\"{path}\" \"{tempDir}\" *.BDF /S /L /NJH /NJS /NP /NS /NC /NDL",
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = System.Diagnostics.Process.Start(psi);
-            if (process != null)
-            {
-                var output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit();
-
-                foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                {
-                    var trimmed = line.Trim();
-                    if (trimmed.EndsWith(".BDF", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var fullPath = Path.IsPathRooted(trimmed) ? trimmed : Path.Combine(path, trimmed);
-                        files.Add(fullPath);
-                    }
-                }
-            }
-
-            try { Directory.Delete(tempDir, true); } catch { }
-        }
-        catch { }
-
-        return files;
-    }
-
-    /// <summary>
-    /// Enumeracao de arquivos usando Win32 API (FindFirstFile/FindNextFile)
-    /// Mais rapido que Directory.EnumerateFiles para grandes volumes de arquivos
-    /// </summary>
-    private static IEnumerable<string> GetFilesWithWin32Api(string path, string pattern = "*.BDF")
-    {
-        var files = new List<string>();
-        var directoriesToProcess = new Stack<string>();
-        directoriesToProcess.Push(path);
-
-        while (directoriesToProcess.Count > 0)
-        {
-            var currentDir = directoriesToProcess.Pop();
-
-            // Primeiro, buscar subdiretorios
-            var searchPathDirs = Path.Combine(currentDir, "*");
-            var findHandleDirs = NativeMethods.FindFirstFileW(searchPathDirs, out var findDataDirs);
-
-            if (findHandleDirs != NativeMethods.INVALID_HANDLE_VALUE)
-            {
-                try
-                {
-                    do
-                    {
-                        if (findDataDirs.cFileName == "." || findDataDirs.cFileName == "..")
-                            continue;
-
-                        if ((findDataDirs.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0)
-                        {
-                            directoriesToProcess.Push(Path.Combine(currentDir, findDataDirs.cFileName));
-                        }
-                    } while (NativeMethods.FindNextFileW(findHandleDirs, out findDataDirs));
-                }
-                finally
-                {
-                    NativeMethods.FindClose(findHandleDirs);
-                }
-            }
-
-            // Depois, buscar arquivos com o pattern
-            var searchPathFiles = Path.Combine(currentDir, pattern);
-            var findHandleFiles = NativeMethods.FindFirstFileW(searchPathFiles, out var findDataFiles);
-
-            if (findHandleFiles != NativeMethods.INVALID_HANDLE_VALUE)
-            {
-                try
-                {
-                    do
-                    {
-                        if ((findDataFiles.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) == 0)
-                        {
-                            files.Add(Path.Combine(currentDir, findDataFiles.cFileName));
-                        }
-                    } while (NativeMethods.FindNextFileW(findHandleFiles, out findDataFiles));
-                }
-                finally
-                {
-                    NativeMethods.FindClose(findHandleFiles);
-                }
-            }
-        }
-
-        return files;
-    }
-
-    /// <summary>
-    /// Versao thread-safe que adiciona diretamente a uma ConcurrentBag
-    /// </summary>
-    private static void EnumerateFilesWithWin32Api(string path, string pattern, ConcurrentBag<FileHandleInfo> results, ref int fileCount)
-    {
-        var directoriesToProcess = new Stack<string>();
-        directoriesToProcess.Push(path);
-
-        while (directoriesToProcess.Count > 0)
-        {
-            var currentDir = directoriesToProcess.Pop();
-
-            // Primeiro, buscar subdiretorios
-            var searchPathDirs = Path.Combine(currentDir, "*");
-            var findHandleDirs = NativeMethods.FindFirstFileW(searchPathDirs, out var findDataDirs);
-
-            if (findHandleDirs != NativeMethods.INVALID_HANDLE_VALUE)
-            {
-                try
-                {
-                    do
-                    {
-                        if (findDataDirs.cFileName == "." || findDataDirs.cFileName == "..")
-                            continue;
-
-                        if ((findDataDirs.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) != 0)
-                        {
-                            directoriesToProcess.Push(Path.Combine(currentDir, findDataDirs.cFileName));
-                        }
-                    } while (NativeMethods.FindNextFileW(findHandleDirs, out findDataDirs));
-                }
-                finally
-                {
-                    NativeMethods.FindClose(findHandleDirs);
-                }
-            }
-
-            // Depois, buscar arquivos com o pattern
-            var searchPathFiles = Path.Combine(currentDir, pattern);
-            var findHandleFiles = NativeMethods.FindFirstFileW(searchPathFiles, out var findDataFiles);
-
-            if (findHandleFiles != NativeMethods.INVALID_HANDLE_VALUE)
-            {
-                try
-                {
-                    do
-                    {
-                        if ((findDataFiles.dwFileAttributes & NativeMethods.FILE_ATTRIBUTE_DIRECTORY) == 0)
-                        {
-                            var filePath = Path.Combine(currentDir, findDataFiles.cFileName);
-                            if (TryExtractHandle(filePath, out var handle, out var fileName))
-                            {
-                                results.Add(new FileHandleInfo(filePath, fileName, handle));
-                                Interlocked.Increment(ref fileCount);
-                            }
-                        }
-                    } while (NativeMethods.FindNextFileW(findHandleFiles, out findDataFiles));
-                }
-                finally
-                {
-                    NativeMethods.FindClose(findHandleFiles);
-                }
-            }
-        }
-    }
-
     private void ExportResults(string filePath)
     {
         try
@@ -2094,7 +1966,7 @@ public partial class MainForm : Form
 
             // Log completo do processamento
             sb.AppendLine("============================================");
-            sb.AppendLine("              LOG DE EXECUCAO");
+            sb.AppendLine("              LOG DE EXECUÇÃO");
             sb.AppendLine("============================================");
             sb.AppendLine(txtLog.Text);
             sb.AppendLine();
@@ -2102,9 +1974,9 @@ public partial class MainForm : Form
             // Lista de arquivos órfãos
             var orphanList = _orphanFiles.OrderBy(o => o.Tabela).ThenBy(o => o.Handle).ToList();
             sb.AppendLine("============================================");
-            sb.AppendLine("     LISTA DE ARQUIVOS ORFAOS");
+            sb.AppendLine("     LISTA DE ARQUIVOS ÓRFÃOS");
             sb.AppendLine("============================================");
-            sb.AppendLine($"Total: {orphanList.Count} arquivos | Espaco: {FormatSize(_totalOrphanSize)}");
+            sb.AppendLine($"Total: {orphanList.Count} arquivos | Espaço: {FormatSize(_totalOrphanSize)}");
             sb.AppendLine();
 
             foreach (var orphan in orphanList)
@@ -2114,11 +1986,11 @@ public partial class MainForm : Form
 
             File.WriteAllText(filePath, sb.ToString(), Encoding.UTF8);
 
-            Log($"Relatorio exportado: {filePath}", Color.Green);
+            Log($"Relatório exportado: {filePath}", Color.Green);
         }
         catch (Exception ex)
         {
-            Log($"Erro ao exportar relatorio: {ex.Message}", Color.Red);
+            Log($"Erro ao exportar relatório: {ex.Message}", Color.Red);
         }
     }
 
@@ -2138,15 +2010,11 @@ public partial class MainForm : Form
             var lines = new[]
             {
                 txtBdocPath.Text,
-                txtSystemName.Text,
-                txtServer.Text,
-                txtDatabase.Text,
-                txtUsername.Text,
+                txtAppServer.Text,
+                cmbSistema.Text,
                 cmbSearchMethod.SelectedIndex.ToString(),
                 numParallelism.Value.ToString(),
-                txtBackupPath.Text,
-                cmbDatabaseType.SelectedIndex.ToString(),
-                txtPort.Text
+                txtBackupPath.Text
             };
             File.WriteAllLines(settingsPath, lines);
         }
@@ -2161,32 +2029,29 @@ public partial class MainForm : Form
             if (File.Exists(settingsPath))
             {
                 var lines = File.ReadAllLines(settingsPath);
-                if (lines.Length >= 6)
+                // Novo formato (6 linhas): bdoc, appServer, sistema, metodo, threads, backup
+                if (lines.Length >= 3)
                 {
                     txtBdocPath.Text = lines[0];
-                    txtSystemName.Text = lines[1];
-                    txtServer.Text = lines[2];
-                    txtDatabase.Text = lines[3];
-                    txtUsername.Text = lines[4];
-                    if (int.TryParse(lines[5], out var index))
-                        cmbSearchMethod.SelectedIndex = Math.Min(index, cmbSearchMethod.Items.Count - 1);
+                    txtAppServer.Text = lines[1];
+                    // Sistema: adicionar como item e selecionar (será recarregado ao conectar)
+                    if (!string.IsNullOrWhiteSpace(lines[2]))
+                    {
+                        cmbSistema.Items.Add(lines[2]);
+                        cmbSistema.SelectedIndex = 0;
+                    }
                 }
-                if (lines.Length >= 7 && decimal.TryParse(lines[6], out var parallelism))
+                if (lines.Length >= 4 && int.TryParse(lines[3], out var index))
+                {
+                    cmbSearchMethod.SelectedIndex = Math.Min(index, cmbSearchMethod.Items.Count - 1);
+                }
+                if (lines.Length >= 5 && decimal.TryParse(lines[4], out var parallelism))
                 {
                     numParallelism.Value = Math.Clamp(parallelism, numParallelism.Minimum, numParallelism.Maximum);
                 }
-                if (lines.Length >= 8)
+                if (lines.Length >= 6)
                 {
-                    txtBackupPath.Text = lines[7];
-                }
-                // Novos campos: tipo de banco e porta
-                if (lines.Length >= 9 && int.TryParse(lines[8], out var dbType))
-                {
-                    cmbDatabaseType.SelectedIndex = Math.Min(dbType, cmbDatabaseType.Items.Count - 1);
-                }
-                if (lines.Length >= 10)
-                {
-                    txtPort.Text = lines[9];
+                    txtBackupPath.Text = lines[5];
                 }
             }
         }
