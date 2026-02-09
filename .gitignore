@@ -4,6 +4,7 @@ obj/
 .publish/
 publish/
 publish-small/
+.claude/
 
 # .NET user-specific
 *.user
